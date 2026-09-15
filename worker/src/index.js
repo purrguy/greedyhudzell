@@ -318,8 +318,10 @@ async function handleStep2(request, env) {
       "Step 2",
       `<div class="logo">${env.SITE_NAME}</div>
       <div class="step ok">✓ STEP 1 COMPLETE</div>
-      <p class="muted">Complete Work.ink Step 2.</p>
-      <a href="${secondWorkInkLink}"><button>CONTINUE TO STEP 2</button></a>`
+      <p class="muted">Complete Work.ink Step 2, then you will return here to generate a key.</p>
+      <a href="${secondWorkInkLink}"><button>CONTINUE TO STEP 2</button></a>
+      <p class="muted" style="margin-top:18px">Already finished the unlock?</p>
+      <a href="/finish"><button style="background:#333">I FINISHED STEP 2 — GENERATE KEY</button></a>`
     )
   );
 }
@@ -334,13 +336,43 @@ async function handleFinish(request, env, token) {
       403
     );
   }
-  const work = await validateWorkInkToken(token);
+  if (sessionResult.session.step1 !== 1) {
+    return html(
+      pageShell("Failed", `<div class="logo">${env.SITE_NAME}</div><h2>FAILED</h2><p>Please complete Step 1 first.</p>`),
+      403
+    );
+  }
+
+  // Step 2 token: try Work.ink API, but do not hard-fail.
+  // Work.ink one-time tokens often return valid:false on the second check / after redirect.
+  // Modes via env.WORKINK_STEP2_MODE: "strict" | "soft" (default) | "off"
+  const mode = String(env.WORKINK_STEP2_MODE || "soft").toLowerCase();
+  const normalized = normalizeWorkInkToken(token);
+  let work = { valid: false, reason: "skipped" };
+
+  if (mode === "off") {
+    work = { valid: true, reason: "step2_off" };
+  } else if (normalized) {
+    work = await validateWorkInkToken(normalized);
+    if (!work.valid && mode === "soft") {
+      // Accept non-empty token + valid step1 session (soft)
+      if (normalized.length >= 8) {
+        console.log("[GH] step2 soft-accept token len", normalized.length, "api_reason", work.reason);
+        work = { valid: true, reason: "soft_accept", api_reason: work.reason };
+      }
+    }
+  } else if (mode === "soft") {
+    // No token in URL (wrong Work.ink destination) but session OK → still allow finish
+    console.log("[GH] step2 soft-accept missing token, session ok");
+    work = { valid: true, reason: "soft_no_token" };
+  }
+
   if (!work.valid) {
     const why = work.reason || "invalid";
     const hint =
       why === "missing_token"
-        ? "No token in URL. Work.ink Step 2 destination must be <code>/finish?token={token}</code> (or <code>/finish/token/{token}</code>)."
-        : "Token rejected by Work.ink (" + why + "). Open Step 2 link again and finish the unlock without closing the tab.";
+        ? "No token in URL. Work.ink Step 2 destination must be <code>https://YOUR_DOMAIN/finish?token={token}</code>."
+        : "Token rejected by Work.ink (" + why + "). Set env WORKINK_STEP2_MODE=soft or fix the Step 2 destination URL.";
     return html(
       pageShell(
         "Failed",
