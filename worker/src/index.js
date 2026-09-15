@@ -125,22 +125,81 @@ function getCookie(request, name) {
   return null;
 }
 /* ===================== WORK.INK ===================== */
-async function validateWorkInkToken(token) {
-  if (!token || token.length > 500) return { valid: false, reason: "missing_token" };
-  try {
-    const safeToken = encodeURIComponent(token);
-    const response = await fetch(`https://work.ink/_api/v2/token/isValid/${safeToken}`);
-    if (!response.ok) return { valid: false, reason: "workink_http_error" };
-    const data = await response.json();
-    return {
-      valid: data.valid === true,
-      byIp: data.info?.byIp ?? data.byIp ?? null,
-      info: data.info ?? null,
-    };
-  } catch (error) {
-    console.error("Work.ink validation error:", error);
-    return { valid: false, reason: "workink_request_failed" };
+function normalizeWorkInkToken(raw) {
+  if (raw == null) return "";
+  let t = String(raw).trim();
+  if (!t) return "";
+  // strip wrapping quotes
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    t = t.slice(1, -1).trim();
   }
+  // decode once if percent-encoded
+  if (t.includes("%")) {
+    try {
+      const d = decodeURIComponent(t);
+      if (d && d.length <= 500) t = d.trim();
+    } catch (_) {}
+  }
+  // work.ink sometimes appends extra query junk
+  if (t.includes("?")) t = t.split("?")[0];
+  if (t.includes("#")) t = t.split("#")[0];
+  return t.slice(0, 500);
+}
+
+async function validateWorkInkToken(token) {
+  const t = normalizeWorkInkToken(token);
+  if (!t) return { valid: false, reason: "missing_token" };
+  const candidates = [t];
+  // also try URI-encoded form if different
+  try {
+    const enc = encodeURIComponent(t);
+    if (enc !== t) candidates.push(enc);
+  } catch (_) {}
+
+  let lastReason = "workink_invalid";
+  for (const cand of candidates) {
+    try {
+      // path segment: prefer encode so special chars are safe
+      const pathTok = cand.includes("%") ? cand : encodeURIComponent(cand);
+      const response = await fetch(`https://work.ink/_api/v2/token/isValid/${pathTok}`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (!response.ok) {
+        lastReason = "workink_http_" + response.status;
+        continue;
+      }
+      const data = await response.json().catch(() => ({}));
+      const ok =
+        data.valid === true ||
+        data.success === true ||
+        data.isValid === true ||
+        data.status === "valid" ||
+        data.status === true;
+      if (ok) {
+        return {
+          valid: true,
+          byIp: data.info?.byIp ?? data.byIp ?? null,
+          info: data.info ?? data,
+          reason: "ok",
+        };
+      }
+      lastReason = "workink_invalid";
+    } catch (error) {
+      console.error("Work.ink validation error:", error);
+      lastReason = "workink_request_failed";
+    }
+  }
+  return { valid: false, reason: lastReason };
+}
+
+function extractWorkInkToken(request, url, pathToken) {
+  if (pathToken) return normalizeWorkInkToken(pathToken);
+  const sp = url.searchParams;
+  return normalizeWorkInkToken(
+    sp.get("token") || sp.get("t") || sp.get("code") || sp.get("key") || ""
+  );
 }
 /* ===================== DB / SESSION ===================== */
 async function createSession(env, ipHash) {
@@ -271,14 +330,22 @@ async function handleFinish(request, env, token) {
   const sessionResult = await validSession(env, sessionId, ipHash);
   if (!sessionResult.valid) {
     return html(
-      pageShell("Failed", `<div class="logo">${env.SITE_NAME}</div><h2>FAILED</h2><p>Your session is invalid or expired.</p>`),
+      pageShell("Failed", `<div class="logo">${env.SITE_NAME}</div><h2>FAILED</h2><p>Your session is invalid or expired. Complete Step 1 again (same browser).</p><p class="muted">reason: ${sessionResult.reason || "unknown"}</p>`),
       403
     );
   }
   const work = await validateWorkInkToken(token);
   if (!work.valid) {
+    const why = work.reason || "invalid";
+    const hint =
+      why === "missing_token"
+        ? "No token in URL. Work.ink Step 2 destination must be <code>/finish?token={token}</code> (or <code>/finish/token/{token}</code>)."
+        : "Token rejected by Work.ink (" + why + "). Open Step 2 link again and finish the unlock without closing the tab.";
     return html(
-      pageShell("Failed", `<div class="logo">${env.SITE_NAME}</div><h2>FAILED</h2><p>Invalid Work.ink Step 2 token.</p>`),
+      pageShell(
+        "Failed",
+        `<div class="logo">${env.SITE_NAME}</div><h2>FAILED</h2><p>Invalid Work.ink Step 2 token.</p><p class="muted">${hint}</p>`
+      ),
       403
     );
   }
@@ -2908,8 +2975,13 @@ export default {
         return await handleGetKeyToken(request, env, token);
       }
       if (request.method === "GET" && path === "/step2") return await handleStep2(request, env);
+      if (request.method === "GET" && path.startsWith("/finish/token/")) {
+        const token = decodeURIComponent(path.slice("/finish/token/".length));
+        return await handleFinish(request, env, token);
+      }
       if (request.method === "GET" && path === "/finish") {
-        return await handleFinish(request, env, url.searchParams.get("token"));
+        const tok = extractWorkInkToken(request, url, null);
+        return await handleFinish(request, env, tok);
       }
       if (request.method === "POST" && path === "/generate-key") return await handleGenerateKey(request, env);
       if (request.method === "POST" && path === "/validate") return await handleValidate(request, env);
