@@ -582,6 +582,7 @@ async function handleAdminKeys(request, env, rotation) {
       key: k.key,
       username: k.username,
       plan: k.plan || "day",
+      discord_id: k.discord_id != null ? String(k.discord_id) : null,
       executed: k.executed === 1,
       last_execution: k.last_execution,
       created_at: k.created_at,
@@ -591,6 +592,60 @@ async function handleAdminKeys(request, env, rotation) {
     })),
   });
 }
+
+async function handleAdminKeysByDiscord(request, env) {
+  if (!adminAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
+  const url = new URL(request.url);
+  const discordId = String(
+    url.searchParams.get("discord_id") || url.searchParams.get("discordId") || ""
+  ).replace(/\D/g, "");
+  if (!discordId || discordId.length < 15) {
+    return json({ ok: false, error: "missing_discord_id" }, 400);
+  }
+  let result;
+  try {
+    result = await env.DB.prepare(
+      `SELECT * FROM keys WHERE CAST(discord_id AS TEXT) = ? ORDER BY created_at DESC`
+    )
+      .bind(discordId)
+      .all();
+  } catch (e) {
+    return json(
+      {
+        ok: false,
+        error: "discord_id_query_failed",
+        hint: "ALTER TABLE keys ADD COLUMN discord_id TEXT;",
+        details: String(e && e.message ? e.message : e),
+      },
+      500
+    );
+  }
+  const rows = (result && result.results) || [];
+  return json({
+    ok: true,
+    success: true,
+    discord_id: discordId,
+    keys: rows.map((k) => ({
+      key: k.key,
+      username: k.username,
+      plan: k.plan || "day",
+      discord_id: k.discord_id != null ? String(k.discord_id) : null,
+      executed: k.executed === 1,
+      activated: k.activated === 1 || k.executed === 1,
+      last_execution: k.last_execution,
+      created_at: k.created_at,
+      expires_at: k.expires_at,
+      revoked: k.revoked === 1,
+      status:
+        k.revoked === 1
+          ? "REVOKED"
+          : k.expires_at && k.expires_at <= now()
+            ? "EXPIRED"
+            : "ACTIVE",
+    })),
+  });
+}
+
 async function handleAdminRevoke(request, env) {
   if (!adminAuthorized(request, env)) return json({ success: false, reason: "unauthorized" }, 401);
   let body;
@@ -613,6 +668,7 @@ async function handleAdminKey(request, env, key) {
     key: record.key,
     username: record.username,
     plan: record.plan || "day",
+    discord_id: record.discord_id != null ? String(record.discord_id) : null,
     session_id: record.session_id,
     created_at: record.created_at,
     expires_at: record.expires_at,
@@ -3034,6 +3090,9 @@ export default {
       if (request.method === "POST" && path === "/api/discord/create-webhook") return await handleCreateWebhook(request, env);
       if (request.method === "POST" && path === "/api/session/join") return await handleSessionJoin(request, env);
       if (request.method === "GET" && path === "/admin/stats") return await handleAdminStats(request, env);
+      if (request.method === "GET" && (path === "/admin/keys-by-discord" || path === "/admin/keys")) {
+        return await handleAdminKeysByDiscord(request, env);
+      }
       const adminKeyMatch = path.match(/^\/admin\/key\/(.+)$/);
       if (request.method === "GET" && adminKeyMatch) {
         return await handleAdminKey(request, env, decodeURIComponent(adminKeyMatch[1]));
