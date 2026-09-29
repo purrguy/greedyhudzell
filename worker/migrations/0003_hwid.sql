@@ -1,0 +1,2 @@
+ALTER TABLE keys ADD COLUMN hwid TEXT;
+ALTER TABLE keys ADD COLUMN hwid_reset_at INTEGER;

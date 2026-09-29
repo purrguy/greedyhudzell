@@ -483,7 +483,34 @@ async function handleValidate(request, env) {
     }
   }
 
+  // HWID bind (replaces username bind when the client sends hwid).
+  // First contact binds + auto-activates (no Discord needed); then strict match.
+  const hwid = typeof body.hwid === "string" ? body.hwid.trim().slice(0, 128) : "";
+  let hwidOk = false;
+  if (hwid) {
+    if (!record.hwid) {
+      try {
+        await env.DB.prepare(`UPDATE keys SET hwid = ?, username = ?, activated = 1 WHERE key = ?`).bind(hwid, username, key).run();
+      } catch {
+        return json({ valid: false, reason: "bind_failed" });
+      }
+      record.hwid = hwid;
+      record.username = username;
+      record.activated = 1;
+      hwidOk = true;
+    } else if (record.hwid === hwid) {
+      hwidOk = true;
+      if (record.username !== username) {
+        try { await env.DB.prepare(`UPDATE keys SET username = ? WHERE key = ?`).bind(username, key).run(); } catch (_) {}
+        record.username = username;
+      }
+    } else {
+      return json({ valid: false, reason: "hwid_mismatch", message: "Key is bound to another machine. Use /reset-hwid (once per 7 days)." });
+    }
+  }
+
   // Keys start inactive; Discord Verify sets activated = 1
+  // (HWID first-bind auto-activates above, so this only hits legacy keys)
   // Legacy rows: activated NULL → allow if already executed/discord linked
   const act = record.activated;
   if (act === 0 || act === "0") {
@@ -513,17 +540,9 @@ async function handleValidate(request, env) {
     }
   }
 
-  // Discord bind: if key already has discord_id, client must send the same one
-  if (record.discord_id) {
-    if (discordId && String(record.discord_id) !== discordId) {
-      return json({
-        valid: false,
-        reason: "discord_mismatch",
-        message: "Key is bound to another Discord account",
-      });
-    }
-  } else if (discordId) {
-    // first time: attach discord_id if column exists
+  // Discord bind: informational only (HWID is the anti-share now).
+  // First send attaches; mismatches no longer reject.
+  if (!record.discord_id && discordId) {
     try {
       await env.DB.prepare(`UPDATE keys SET discord_id = ? WHERE key = ?`).bind(discordId, key).run();
     } catch (_) {}
@@ -543,6 +562,7 @@ async function handleValidate(request, env) {
     paid: isPaidPlan(record.plan, key),
     rewire_allowed: isPaidPlan(record.plan, key),
     testing: record.testing === 1,
+    hwid_bound: Boolean(record.hwid || hwidOk),
   });
 }
 /* ===================== ADMIN ===================== */
@@ -807,6 +827,29 @@ async function handleAdminRewire(request, env) {
     plan: record.plan || "paid",
     expires_at: record.expires_at,
   });
+}
+
+/** Reset HWID bind — at most once per 7 days per key */
+async function handleAdminResetHwid(request, env) {
+  if (!adminAuthorized(request, env)) return json({ success: false, reason: "unauthorized" }, 401);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ success: false, reason: "invalid_json" }, 400);
+  }
+  const key = typeof body.key === "string" ? body.key.trim() : "";
+  if (!key) return json({ success: false, reason: "missing_key" }, 400);
+  const record = await env.DB.prepare(`SELECT * FROM keys WHERE key = ? LIMIT 1`).bind(key).first();
+  if (!record) return json({ success: false, reason: "key_not_found" }, 404);
+  if (!record.hwid) return json({ success: true, key, already_free: true });
+  const week = 7 * 24 * 60 * 60;
+  const last = Number(record.hwid_reset_at) || 0;
+  if (last && now() - last < week) {
+    return json({ success: false, reason: "reset_cooldown", reset_available_at: last + week }, 400);
+  }
+  await env.DB.prepare(`UPDATE keys SET hwid = NULL, hwid_reset_at = ? WHERE key = ?`).bind(now(), key).run();
+  return json({ success: true, key, reset_at: now() });
 }
 
 /** Key issuance stats (day / week / totals) */
@@ -3094,6 +3137,7 @@ export default {
       if (request.method === "POST" && path === "/admin/kick") return await handleAdminKick(request, env);
       if (request.method === "POST" && path === "/admin/webhook-register") return await handleWebhookRegister(request, env);
       if (request.method === "POST" && path === "/admin/rewire") return await handleAdminRewire(request, env);
+      if (request.method === "POST" && path === "/admin/reset-hwid") return await handleAdminResetHwid(request, env);
       if (request.method === "GET" && path === "/api/session/kick-check") return await handleKickCheck(request, env, url);
       if (request.method === "POST" && path === "/api/discord/create-webhook") return await handleCreateWebhook(request, env);
       if (request.method === "POST" && path === "/api/session/join") return await handleSessionJoin(request, env);
