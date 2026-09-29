@@ -2371,7 +2371,7 @@ async function handleDiscordProfile(request, env) {
  * Vars: OAUTH_REDIRECT = https://greedyhudzell.xyz/api/discord/oauth/callback
  * D1: run migration discord_oauth table
  */
-const OAUTH_SCOPES = "identify guilds";
+const OAUTH_SCOPES = "identify guilds guilds.join";
 
 function oauthRedirectUri(env, request) {
   if (env.OAUTH_REDIRECT) return env.OAUTH_REDIRECT;
@@ -2524,11 +2524,24 @@ async function handleOauthCallback(request, env) {
       .run();
   }
 
+  // Auto-join our guild straight from OAuth (needs guilds.join scope).
+  // Member role itself is granted by Verify afterwards.
+  let joined = false, joinErr = null;
+  try {
+    const joinGuild = env.DISCORD_GUILD_ID || "1422222409846620201";
+    const jr = await discordApi(env, "PUT", `/guilds/${joinGuild}/members/${state}`, { access_token: access });
+    joined = jr.ok || jr.status === 201 || jr.status === 204;
+    if (!joined) joinErr = "discord_" + jr.status;
+  } catch (e) {
+    joinErr = String((e && e.message) || e).slice(0, 80);
+  }
+
   return html(
     `<!doctype html><html><body style="font-family:system-ui;background:#0b0b0b;color:#eee;padding:2rem;text-align:center">
     <h1 style="color:#d4af37">Connected</h1>
     <p>Discord <b>${me.username || state}</b> authorized.</p>
     <p>Servers seen: <b>${guildIds.length}</b></p>
+    <p>${joined ? "Joined the Greedy Hudzell server." : "Auto-join: " + (joinErr || "already a member") + ". If you are not in, use the invite."}</p>
     <p>Return to Discord and press <b>Verify</b> again.</p>
     <p style="opacity:.6;font-size:12px">You can close this tab.</p>
     <script>try{window.close()}catch(e){}</script>
@@ -2758,6 +2771,69 @@ async function handleDiscordRewire(request, env) {
 }
 
 
+
+/* ===================== ADMIN MESSAGES (popup queue) ===================== */
+async function ensureMessagesTable(env) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        key TEXT,
+        discord_id TEXT,
+        user_id TEXT,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0
+      )`
+    ).run();
+  } catch (_) {}
+}
+
+/** Queue a popup for a key / discord user / roblox user. Admin only. */
+async function handleAdminMessage(request, env) {
+  if (!adminAuthorized(request, env)) return json({ success: false, reason: "unauthorized" }, 401);
+  await ensureMessagesTable(env);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ success: false, reason: "invalid_json" }, 400);
+  }
+  const key = typeof body.key === "string" ? body.key.trim() : "";
+  const discordId = String(body.discord_id || body.discordId || "").replace(/\D/g, "");
+  const userId = String(body.user_id || body.userId || body.roblox_id || "").replace(/\D/g, "");
+  const text = typeof body.text === "string" ? body.text.trim().slice(0, 300) : "";
+  if (!text) return json({ success: false, reason: "missing_text" }, 400);
+  if (!key && !discordId && !userId) return json({ success: false, reason: "missing_target" }, 400);
+  const r = await env.DB.prepare(
+    `INSERT INTO messages (key, discord_id, user_id, text, created_at, delivered)
+     VALUES (?, ?, ?, ?, ?, 0)`
+  ).bind(key || null, discordId || null, userId || null, text, now()).run();
+  return json({ success: true, id: Number(r.meta.last_row_id) || null });
+}
+
+/** Client poll: pending popups for this key/user/discord. Marks delivered. */
+async function handleMessageCheck(request, env, url) {
+  await ensureMessagesTable(env);
+  const key = (url.searchParams.get("key") || "").trim();
+  const userId = (url.searchParams.get("userId") || "").trim();
+  const discordId = (url.searchParams.get("discordId") || "").trim();
+  if (!key && !userId && !discordId) return json({ messages: [] });
+  const rows = await env.DB.prepare(
+    `SELECT id, text FROM messages
+     WHERE delivered = 0 AND (key = ? OR user_id = ? OR discord_id = ?)
+     ORDER BY id ASC LIMIT 10`
+  ).bind(key, userId, discordId).all();
+  const list = (rows.results || []).map((m) => ({ id: m.id, text: m.text }));
+  if (list.length) {
+    const ids = list.map((m) => m.id);
+    await env.DB.prepare(
+      `UPDATE messages SET delivered = 1 WHERE id IN (${ids.map(() => "?").join(",")})`
+    ).bind(...ids).run();
+  }
+  return json({ messages: list });
+}
 
 /* ===================== BANS / KICKS / WEBHOOKS ===================== */
 async function ensureBanTables(env) {
@@ -3139,6 +3215,8 @@ export default {
       if (request.method === "POST" && path === "/admin/rewire") return await handleAdminRewire(request, env);
       if (request.method === "POST" && path === "/admin/reset-hwid") return await handleAdminResetHwid(request, env);
       if (request.method === "GET" && path === "/api/session/kick-check") return await handleKickCheck(request, env, url);
+      if (request.method === "GET" && path === "/api/session/message-check") return await handleMessageCheck(request, env, url);
+      if (request.method === "POST" && path === "/admin/message") return await handleAdminMessage(request, env);
       if (request.method === "POST" && path === "/api/discord/create-webhook") return await handleCreateWebhook(request, env);
       if (request.method === "POST" && path === "/api/session/join") return await handleSessionJoin(request, env);
       if (request.method === "GET" && path === "/admin/stats") return await handleAdminStats(request, env);
