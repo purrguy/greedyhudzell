@@ -541,6 +541,7 @@ async function handleValidate(request, env) {
     discord_linked: Boolean(discordBound),
     paid: isPaidPlan(record.plan, key),
     rewire_allowed: isPaidPlan(record.plan, key),
+    testing: record.testing === 1,
   });
 }
 /* ===================== ADMIN ===================== */
@@ -675,6 +676,7 @@ async function handleAdminKey(request, env, key) {
     revoked: record.revoked === 1,
     executed: record.executed === 1,
     last_execution: record.last_execution,
+    testing: record.testing === 1,
     status: record.revoked === 1 ? "REVOKED" : record.expires_at <= now() ? "EXPIRED" : "ACTIVE",
   });
 }
