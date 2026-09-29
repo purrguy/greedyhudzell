@@ -3011,7 +3011,7 @@ export default {
         return html(homePage());
       }
       if (request.method === "GET" && path === "/status") return html(statusPage());
-      if (request.method === "GET" && path === "/executors") return html(executorsPage());
+      if (request.method === "GET" && (path === "/executors" || path === "/executor")) return html(executorsPage());
       if (request.method === "GET" && path === "/guide") return html(guidePage());
       if (request.method === "GET" && path === "/pricing") return html(pricingPage());
       if (request.method === "GET" && path === "/tos") return html(tosPage());
