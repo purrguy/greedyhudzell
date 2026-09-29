@@ -1622,6 +1622,7 @@ function obfuscatePage(siteName) {
   <div class="badge">Tools</div>
   <h1>Lua Obfuscator</h1>
   <p class="sub">Long-bracket contents processed when present · safe API plugins · optional Shamir helper · one-line minify</p>
+  <div style="margin:14px 0;padding:12px 16px;border:1px solid var(--gold,#f0b429);border-radius:10px;background:rgba(240,180,41,.08)">Greedy Hudzell obfuscator has been renamed to <b>lime</b>! Purchase it here: <a href="https://lime.greedyhudzell.xyz" style="color:var(--gold,#f0b429)">lime.greedyhudzell.xyz</a></div>
   <div class="card">
     <label class="f">Level</label>
     <select id="preset" class="f" style="width:100%;margin-bottom:12px;padding:10px;border-radius:8px;background:var(--bg2);color:var(--text);border:1px solid var(--border)">
@@ -1897,11 +1898,13 @@ function fmtSunc(v) {
 
 function homePage() {
   return siteShell("Home", "home", `
+  <img src="https://raw.githubusercontent.com/purrguy/greedyhudzell/main/GH%20banner.png" alt="Greedy Hudzell" style="width:100%;border-radius:12px;margin-bottom:14px" onerror="this.style.display='none'"/>
   <div class="badge">Official</div>
   <h1>Greedy Hudzell</h1>
   <p class="sub">Keys, loader, updates. Check your key status below.</p>
   <div class="hero-actions">
     <a class="btn btn-gold" href="${FREE_KEY_LINK}" target="_blank" rel="noopener">Get free key</a>
+    <span class="btn" style="opacity:.5;cursor:not-allowed" title="Coming soon">Get key via Linkvertise (soon)</span>
     <a class="btn" href="/pricing">Pricing</a>
     <a class="btn" href="${DISCORD_INVITE}" target="_blank" rel="noopener">Discord</a>
   </div>
