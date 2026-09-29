@@ -843,10 +843,16 @@ async function handleAdminResetHwid(request, env) {
   const record = await env.DB.prepare(`SELECT * FROM keys WHERE key = ? LIMIT 1`).bind(key).first();
   if (!record) return json({ success: false, reason: "key_not_found" }, 404);
   if (!record.hwid) return json({ success: true, key, already_free: true });
+  const paid = isPaidPlan(record.plan, key);
   const week = 7 * 24 * 60 * 60;
   const last = Number(record.hwid_reset_at) || 0;
-  if (last && now() - last < week) {
-    return json({ success: false, reason: "reset_cooldown", reset_available_at: last + week }, 400);
+  if (last) {
+    if (!paid) {
+      return json({ success: false, reason: "free_used", message: "Free keys get 1 HWID reset. Paid keys reset every 7 days." }, 400);
+    }
+    if (now() - last < week) {
+      return json({ success: false, reason: "reset_cooldown", reset_available_at: last + week }, 400);
+    }
   }
   await env.DB.prepare(`UPDATE keys SET hwid = NULL, hwid_reset_at = ? WHERE key = ?`).bind(now(), key).run();
   return json({ success: true, key, reset_at: now() });
@@ -1954,6 +1960,11 @@ function homePage() {
     <a class="btn" href="/pricing">Pricing</a>
     <a class="btn" href="${DISCORD_INVITE}" target="_blank" rel="noopener">Discord</a>
   </div>
+  <div class="grid2" style="margin-top:14px">
+    <div class="card"><h3 style="margin-bottom:4px">Executions</h3><p class="muted" id="st_exec" style="font-size:22px">—</p></div>
+    <div class="card"><h3 style="margin-bottom:4px">Levels farmed</h3><p class="muted" id="st_lvl" style="font-size:22px">—</p></div>
+  </div>
+  <script>(function(){fetch("/api/stats").then(function(r){return r.json()}).then(function(d){var e=document.getElementById("st_exec"),l=document.getElementById("st_lvl");if(e)e.textContent=d.executions||0;if(l)l.textContent=d.levels_farmed||0;}).catch(function(){});})();</script>
   <div class="grid2">
     <div class="card">
       <h3 style="margin-bottom:8px">Key status</h3>
@@ -2835,6 +2846,84 @@ async function handleMessageCheck(request, env, url) {
   return json({ messages: list });
 }
 
+/* ===================== USAGE STATS (execs + levels) ===================== */
+async function ensureStatsTable(env) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS exec_stats (
+        key TEXT PRIMARY KEY, username TEXT,
+        execs INTEGER NOT NULL DEFAULT 0,
+        max_level INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      )`
+    ).run();
+  } catch (_) {}
+}
+
+/** Loader calls once per execution. */
+async function handleSessionExec(request, env) {
+  await ensureStatsTable(env);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ success: false, reason: "invalid_json" }, 400);
+  }
+  const key = typeof body.key === "string" ? body.key.trim().slice(0, 64) : "";
+  const username = typeof body.username === "string" ? body.username.trim().slice(0, 20) : "";
+  if (!key) return json({ success: false, reason: "missing_key" }, 400);
+  try {
+    await env.DB.prepare(
+      `INSERT INTO exec_stats (key, username, execs, max_level, updated_at)
+       VALUES (?, ?, 1, 0, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         execs = execs + 1, username = excluded.username, updated_at = excluded.updated_at`
+    ).bind(key, username, now()).run();
+  } catch (_) {}
+  return json({ success: true });
+}
+
+/** Hub reports level-ups. */
+async function handleSessionLevel(request, env) {
+  await ensureStatsTable(env);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ success: false, reason: "invalid_json" }, 400);
+  }
+  const key = typeof body.key === "string" ? body.key.trim().slice(0, 64) : "";
+  const level = Math.max(0, Math.floor(Number(body.level) || 0));
+  if (!key || !level) return json({ success: false, reason: "missing_key_or_level" }, 400);
+  try {
+    await env.DB.prepare(
+      `INSERT INTO exec_stats (key, username, execs, max_level, updated_at)
+       VALUES (?, ?, 0, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         max_level = MAX(max_level, excluded.max_level), updated_at = excluded.updated_at`
+    ).bind(key, typeof body.username === "string" ? body.username.trim().slice(0, 20) : "", level, now()).run();
+  } catch (_) {}
+  return json({ success: true });
+}
+
+/** Public totals for the site. */
+async function handlePublicStats(request, env) {
+  await ensureStatsTable(env);
+  try {
+    const r = await env.DB.prepare(
+      `SELECT COUNT(*) AS keys, COALESCE(SUM(execs),0) AS execs, COALESCE(SUM(max_level),0) AS levels FROM exec_stats`
+    ).first();
+    return json({
+      keys: Number(r.keys) || 0,
+      executions: Number(r.execs) || 0,
+      levels_farmed: Number(r.levels) || 0,
+    });
+  } catch (_) {
+    return json({ keys: 0, executions: 0, levels_farmed: 0 });
+  }
+}
+
 /* ===================== BANS / KICKS / WEBHOOKS ===================== */
 async function ensureBanTables(env) {
   if (!env.DB) return;
@@ -3216,6 +3305,9 @@ export default {
       if (request.method === "POST" && path === "/admin/reset-hwid") return await handleAdminResetHwid(request, env);
       if (request.method === "GET" && path === "/api/session/kick-check") return await handleKickCheck(request, env, url);
       if (request.method === "GET" && path === "/api/session/message-check") return await handleMessageCheck(request, env, url);
+      if (request.method === "POST" && path === "/api/session/exec") return await handleSessionExec(request, env);
+      if (request.method === "POST" && path === "/api/session/level") return await handleSessionLevel(request, env);
+      if (request.method === "GET" && path === "/api/stats") return await handlePublicStats(request, env);
       if (request.method === "POST" && path === "/admin/message") return await handleAdminMessage(request, env);
       if (request.method === "POST" && path === "/api/discord/create-webhook") return await handleCreateWebhook(request, env);
       if (request.method === "POST" && path === "/api/session/join") return await handleSessionJoin(request, env);
