@@ -39,6 +39,7 @@ const DISCORD_INVITE = "https://discord.gg/sbVuaT9a2T";
 /** Public Discord application id (OAuth). Secret stays in env only. */
 const DEFAULT_DISCORD_CLIENT_ID = "1426282728520679454";
 const FREE_KEY_LINK = "https://work.ink/28wp/Greedy-hudzell";
+const WEAO_URL = "https://weao.xyz/api/exploits";
 
 const REDEEM_SUPPORT_HINT =
   "If you bought the Game Pass but could not redeem it, write in Discord: https://discord.com/channels/1422222409846620201/1448630361390055454";
@@ -1750,6 +1751,7 @@ function siteShell(title, active, bodyHtml, wide = false) {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
+<link rel="icon" type="image/png" href="https://raw.githubusercontent.com/purrguy/greedyhudzell/main/logo.png"/>
 <title>${title} · Greedy Hudzell</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
@@ -1899,6 +1901,7 @@ function fmtSunc(v) {
 function homePage() {
   return siteShell("Home", "home", `
   <img src="https://raw.githubusercontent.com/purrguy/greedyhudzell/main/GH%20banner.png" alt="Greedy Hudzell" style="width:100%;border-radius:12px;margin-bottom:14px" onerror="this.style.display='none'"/>
+  <img src="https://raw.githubusercontent.com/purrguy/greedyhudzell/main/logo.png" alt="GH" style="height:64px;border-radius:14px;margin:4px 0 10px" onerror="this.style.display='none'"/>
   <div class="badge">Official</div>
   <h1>Greedy Hudzell</h1>
   <p class="sub">Keys, loader, updates. Check your key status below.</p>
