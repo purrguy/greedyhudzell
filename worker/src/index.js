@@ -319,10 +319,8 @@ async function handleStep2(request, env) {
       "Step 2",
       `<div class="logo">${env.SITE_NAME}</div>
       <div class="step ok">✓ STEP 1 COMPLETE</div>
-      <p class="muted">Complete Work.ink Step 2, then you will return here to generate a key.</p>
-      <a href="${secondWorkInkLink}"><button>CONTINUE TO STEP 2</button></a>
-      <p class="muted" style="margin-top:18px">Already finished the unlock?</p>
-      <a href="/finish"><button style="background:#333">I FINISHED STEP 2 — GENERATE KEY</button></a>`
+      <p class="muted">Complete Work.ink Step 2 below — you will return here automatically and your key loads on its own.</p>
+      <a href="${secondWorkInkLink}"><button>CONTINUE TO STEP 2</button></a>`
     )
   );
 }
@@ -362,10 +360,16 @@ async function handleFinish(request, env, token) {
         work = { valid: true, reason: "soft_accept", api_reason: work.reason };
       }
     }
-  } else if (mode === "soft") {
-    // No token in URL (wrong Work.ink destination) but session OK → still allow finish
-    console.log("[GH] step2 soft-accept missing token, session ok");
-    work = { valid: true, reason: "soft_no_token" };
+  } else {
+    // No token in URL = step 2 was never completed (the skip button that
+    // allowed this is gone). Send them back to do it properly.
+    return html(
+      pageShell(
+        "Failed",
+        `<div class="logo">${env.SITE_NAME}</div><h2>STEP 2 NOT DONE</h2><p>Finish Work.ink Step 2 first — press CONTINUE TO STEP 2 above and complete the unlock. You return here automatically.</p><p class="muted"><a href="/step2" style="color:var(--gold)">← Back to Step 2</a></p>`
+      ),
+      403
+    );
   }
 
   if (!work.valid) {
