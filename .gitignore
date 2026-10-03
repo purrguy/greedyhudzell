@@ -33,3 +33,7 @@ Thumbs.db
 *.log
 *.tmp
 *.temp
+
+# wrangler local state
+.wrangler/
+
