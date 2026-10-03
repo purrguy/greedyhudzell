@@ -383,34 +383,64 @@ async function handleFinish(request, env, token) {
     );
   }
   await env.DB.prepare(`UPDATE sessions SET step2 = 1 WHERE session_id = ?`).bind(sessionId).run();
+  // Auto-generate on page load: one key per session, reused on revisit.
+  // No username asked — the loader binds the real one (HWID) on first use.
+  const timestamp = now();
+  let keyRow = await env.DB.prepare(
+    `SELECT key FROM keys WHERE session_id = ? LIMIT 1`
+  ).bind(sessionId).first();
+  let key = keyRow && keyRow.key;
+  if (!key) {
+    key = generateKey();
+    try {
+      await env.DB.prepare(
+        `INSERT INTO keys (key, username, session_id, created_at, expires_at, revoked, executed, last_execution, plan, activated)
+         VALUES (?, ?, ?, ?, ?, 0, 0, NULL, ?, 0)`
+      ).bind(key, "", sessionId, timestamp, timestamp + KEY_TTL, "day").run();
+    } catch (e) {
+      await env.DB.prepare(
+        `INSERT INTO keys (key, username, session_id, created_at, expires_at, revoked, executed, last_execution, plan)
+         VALUES (?, ?, ?, ?, ?, 0, 0, NULL, ?)`
+      ).bind(key, "", sessionId, timestamp, timestamp + KEY_TTL, "day").run();
+    }
+  }
+  const loaderCode = `loadstring(game:HttpGet("https://greedyhudzell.xyz/loader.lua"))()`;
   return html(
     pageShell(
-      "Key Generator",
+      "Your key",
       `<div class="logo">${env.SITE_NAME}</div>
-      <div class="step ok">✓ STEP 1 COMPLETE</div>
-      <div class="step ok">✓ STEP 2 COMPLETE</div>
-      <label>Roblox username</label>
-      <input id="username" maxlength="20" placeholder="Not displayname!" autocomplete="off">
-      <button onclick="generateKey()">GENERATE KEY</button>
-      <p id="result" class="muted"></p>
-      <script>
-      async function generateKey() {
-        const username = document.getElementById("username").value.trim();
-        const result = document.getElementById("result");
-        if (!username) { result.textContent = "Enter your Roblox username."; return; }
-        result.textContent = "Generating...";
-        try {
-          const response = await fetch("/generate-key", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username })
-          });
-          const data = await response.json();
-          if (!data.success) { result.textContent = data.reason || "Failed to generate key."; return; }
-          result.innerHTML = "Your key:<br><br><strong>" + data.key + "</strong>";
-        } catch { result.textContent = "Network error."; }
-      }
-      </script>`
+      <div class="step ok">✓ KEY READY</div>
+      <label>Your key — click to copy</label>
+      <div class="keybox" id="kbox">${key}</div>
+      <label style="margin-top:16px">Loader — run in your executor</label>
+      <div class="codeblock">
+        <div class="cb-head"><i></i><i></i><i></i><span>loader.lua</span><button class="cb-copy" id="ld-copy2" type="button">Copy</button></div>
+        <pre><code id="ld-code2">${loaderCode}</code></pre>
+      </div>
+      <script>(function(){
+        function wire(boxId, btnId, getText, btnLabel) {
+          var box = document.getElementById(boxId);
+          if (!box) return;
+          function doCopy() {
+            var t = getText();
+            function done() {
+              box.classList.add('copied');
+              var b = btnId && document.getElementById(btnId);
+              var old = b ? b.textContent : '';
+              if (b) b.textContent = 'Copied!';
+              setTimeout(function(){ box.classList.remove('copied'); if (b) b.textContent = old || 'Copy'; }, 1500);
+            }
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(t).then(done, function(){});
+            }
+          }
+          box.addEventListener('click', doCopy);
+          var b = btnId && document.getElementById(btnId);
+          if (b) b.addEventListener('click', doCopy);
+        }
+        wire('kbox', null, function(){ return document.getElementById('kbox').textContent; });
+        wire('ld-code2', 'ld-copy2', function(){ return document.getElementById('ld-code2').textContent; });
+      })();</script>`
     )
   );
 }
@@ -1837,6 +1867,45 @@ a:hover{text-decoration:underline}
   border:1px solid var(--gold);display:grid;place-items:center;
   color:var(--gold);font-size:14px;font-weight:700;
 }
+.brand-logo{width:34px;height:34px;border-radius:10px;border:1px solid var(--gold);object-fit:cover;display:block}
+/* golden code block, markdown-fence style */
+.codeblock{background:#070707;border:1px solid var(--gold);border-radius:12px;overflow:hidden;margin-top:14px}
+.codeblock .cb-head{display:flex;align-items:center;gap:7px;padding:9px 13px;border-bottom:1px solid rgba(201,162,39,.4)}
+.codeblock .cb-head i{width:11px;height:11px;border-radius:50%;background:#3a3a3a}
+.codeblock .cb-head i:nth-child(1){background:#ff5f57}
+.codeblock .cb-head i:nth-child(2){background:#febc2e}
+.codeblock .cb-head i:nth-child(3){background:#28c840}
+.codeblock .cb-head span{margin-left:6px;color:var(--muted);font-size:12px;font-family:ui-monospace,monospace}
+.codeblock .cb-copy{margin-left:auto;background:var(--bg2);border:1px solid var(--gold);color:var(--gold-soft);border-radius:8px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit}
+.codeblock .cb-copy:hover{background:var(--gold);color:#0a0a0a}
+.codeblock pre{padding:14px 15px;font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.65;color:var(--gold-soft);white-space:pre-wrap;word-break:break-all;margin:0}
+/* method modal */
+.mback{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.68);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;padding:20px}
+.mback[hidden]{display:none}
+.modal{background:var(--card);border:1px solid var(--gold);border-radius:18px;box-shadow:0 24px 70px rgba(0,0,0,.6);max-width:400px;width:100%;padding:24px}
+.m-title{font-size:17px;font-weight:700;margin-bottom:4px}
+.m-sub{font-size:13px;color:var(--muted);margin-bottom:16px}
+.dd{position:relative}
+.dd-btn{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;background:#0c0c0c;border:1px solid var(--gold);color:var(--text);border-radius:10px;padding:12px 14px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
+.dd-btn .dd-chev{color:var(--gold);transition:transform .15s}
+.dd.open .dd-btn .dd-chev{transform:rotate(180deg)}
+.dd-list{position:absolute;top:calc(100% + 6px);left:0;right:0;background:#101010;border:1px solid var(--gold);border-radius:12px;overflow:hidden;z-index:5;box-shadow:0 16px 40px rgba(0,0,0,.55)}
+.dd-list[hidden]{display:none}
+.dd-opt{display:block;width:100%;text-align:left;background:transparent;border:none;border-bottom:1px solid var(--border);color:var(--text);padding:12px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+.dd-opt:last-child{border-bottom:none}
+.dd-opt:not(.locked):hover{background:rgba(201,162,39,.1)}
+.dd-opt .dd-sub{display:block;font-size:11px;color:var(--muted);margin-top:2px}
+.dd-opt.locked{opacity:.55;cursor:not-allowed}
+.dd-opt .dd-lock{color:var(--gold);font-size:11px;font-weight:700}
+.m-note{font-size:12px;color:var(--gold-soft);min-height:18px;margin-top:12px;text-align:center}
+.m-actions{display:flex;justify-content:flex-end;margin-top:8px}
+/* key display box */
+.keybox{font-family:ui-monospace,monospace;font-size:17px;font-weight:700;letter-spacing:1px;text-align:center;background:#070707;border:1px solid var(--gold);border-radius:12px;padding:16px 12px;cursor:pointer;user-select:all;color:var(--gold-soft);overflow-wrap:anywhere;word-break:break-word}
+.keybox:hover{background:#0d0d09}
+.keybox.copied{border-color:var(--ok);color:var(--ok)}
+/* golden frames on commerce UI */
+.price-card{border-color:rgba(201,162,39,.45)}
+.price-card.featured{border-color:var(--gold)}
 .nav{display:flex;flex-wrap:wrap;gap:6px}
 .nav a{
   color:var(--muted);padding:8px 14px;border-radius:999px;
@@ -1908,7 +1977,7 @@ th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;le
 <header class="top">
   <div class="top-inner">
     <a class="brand" href="/home">
-      <div class="brand-mark">GH</div>
+      <img class="brand-logo" src="https://raw.githubusercontent.com/purrguy/greedyhudzell/main/logo.png" alt="GH" onerror="this.outerHTML='<div class=&quot;brand-mark&quot;>GH</div>'"/>
       <span>Greedy Hudzell</span>
     </a>
     <nav class="nav">${siteNav(active)}</nav>
@@ -1918,6 +1987,62 @@ th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;le
 ${bodyHtml}
   <div class="foot">© Greedy Hudzell · <a href="${DISCORD_INVITE}">Discord</a> · Not affiliated with Roblox</div>
 </main>
+<div class="mback" id="gh-mback" hidden>
+  <div class="modal">
+    <div class="m-title" id="gh-mtitle">Select method</div>
+    <div class="m-sub" id="gh-msub"></div>
+    <div class="dd" id="gh-dd">
+      <button class="dd-btn" id="gh-ddbtn" type="button"><span id="gh-ddlabel">Choose…</span><span class="dd-chev">▾</span></button>
+      <div class="dd-list" id="gh-ddlist" hidden></div>
+    </div>
+    <div class="m-note" id="gh-mnote"></div>
+    <div class="m-actions"><button class="btn" id="gh-mcancel" type="button">Cancel</button></div>
+  </div>
+</div>
+<script>
+(function(){
+  var back = document.getElementById('gh-mback');
+  if (!back) return;
+  var dd = document.getElementById('gh-dd');
+  var btn = document.getElementById('gh-ddbtn');
+  var list = document.getElementById('gh-ddlist');
+  var note = document.getElementById('gh-mnote');
+  function close() { back.hidden = true; dd.classList.remove('open'); list.hidden = true; }
+  back.addEventListener('click', function(e) { if (e.target === back) close(); });
+  document.getElementById('gh-mcancel').addEventListener('click', close);
+  document.addEventListener('keydown', function(e) { if (e.key === 'Escape') close(); });
+  btn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    dd.classList.toggle('open');
+    list.hidden = !list.hidden;
+  });
+  document.addEventListener('click', function(e) {
+    if (!dd.contains(e.target)) { dd.classList.remove('open'); list.hidden = true; }
+  });
+  window.ghMethods = function(title, sub, opts) {
+    document.getElementById('gh-mtitle').textContent = title;
+    document.getElementById('gh-msub').textContent = sub || '';
+    note.textContent = '';
+    list.innerHTML = '';
+    opts.forEach(function(o) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'dd-opt' + (o.locked ? ' locked' : '');
+      b.innerHTML = '<span>' + o.label + '</span>'
+        + (o.locked ? ' <span class="dd-lock">🔒 ' + (o.lockNote || 'Locked') + '</span>' : '')
+        + (o.sub ? '<span class="dd-sub">' + o.sub + '</span>' : '');
+      b.addEventListener('click', function() {
+        if (o.locked) { note.textContent = o.lockNote || 'Temporarily locked'; return; }
+        close();
+        if (o.href) window.open(o.href, '_blank', 'noopener');
+      });
+      list.appendChild(b);
+    });
+    document.getElementById('gh-ddlabel').textContent = 'Choose…';
+    back.hidden = false;
+  };
+})();
+</script>
 </body>
 </html>`;
 }
@@ -1950,16 +2075,22 @@ function fmtSunc(v) {
 function homePage() {
   return siteShell("Home", "home", `
   <img src="https://raw.githubusercontent.com/purrguy/greedyhudzell/main/GH%20banner.png" alt="Greedy Hudzell" style="width:100%;border-radius:12px;margin-bottom:14px" onerror="this.style.display='none'"/>
-  <img src="https://raw.githubusercontent.com/purrguy/greedyhudzell/main/logo.png" alt="GH" style="height:64px;border-radius:14px;margin:4px 0 10px" onerror="this.style.display='none'"/>
-  <div class="badge">Official</div>
   <h1>Greedy Hudzell</h1>
   <p class="sub">Keys, loader, updates. Check your key status below.</p>
   <div class="hero-actions">
-    <a class="btn btn-gold" href="${FREE_KEY_LINK}" target="_blank" rel="noopener">Get free key</a>
-    <span class="btn" style="opacity:.5;cursor:not-allowed" title="Coming soon">Get key via Linkvertise (soon)</span>
+    <button class="btn btn-gold" id="m-free-btn" type="button">Select method</button>
     <a class="btn" href="/pricing">Pricing</a>
     <a class="btn" href="${DISCORD_INVITE}" target="_blank" rel="noopener">Discord</a>
   </div>
+  <script>(function(){
+    var b = document.getElementById('m-free-btn');
+    if (b && window.ghMethods) b.addEventListener('click', function() {
+      window.ghMethods('Get a free key', 'Pick where to complete the steps:', [
+        { label: 'Work.Ink', sub: '24h key · already set up', href: '${FREE_KEY_LINK}' },
+        { label: 'Linkvertise', sub: 'coming soon', locked: true, lockNote: 'Coming soon' }
+      ]);
+    });
+  })();</script>
   <div class="grid2" style="margin-top:14px">
     <div class="card"><h3 style="margin-bottom:4px">Executions</h3><p class="muted" id="st_exec" style="font-size:22px">—</p></div>
     <div class="card"><h3 style="margin-bottom:4px">Levels farmed</h3><p class="muted" id="st_lvl" style="font-size:22px">—</p></div>
@@ -1977,9 +2108,22 @@ function homePage() {
     </div>
     <div class="card">
       <h3 style="margin-bottom:8px">Loader</h3>
-      <p class="muted" style="word-break:break-all"><code>loadstring(game:HttpGet("https://greedyhudzell.xyz/loader.lua"))()</code></p>
+      <div class="codeblock">
+        <div class="cb-head"><i></i><i></i><i></i><span>loader.lua</span><button class="cb-copy" id="ld-copy" type="button">Copy</button></div>
+        <pre><code id="ld-code">loadstring(game:HttpGet("https://greedyhudzell.xyz/loader.lua"))()</code></pre>
+      </div>
       <p class="muted" style="margin-top:12px"><a href="/guide">Guide</a> · <a href="/executors">Executors</a> · <a href="/status">Status</a></p>
     </div>
+  <script>(function(){
+    var b = document.getElementById('ld-copy');
+    if (b) b.addEventListener('click', function() {
+      var t = document.getElementById('ld-code').textContent;
+      function done() { b.textContent = 'Copied!'; setTimeout(function(){ b.textContent = 'Copy'; }, 1500); }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(t).then(done, function() {});
+      }
+    });
+  })();</script>
   </div>
 <script>
 (function(){
@@ -2121,7 +2265,7 @@ function pricingPage() {
         <li>Work.ink unlock</li>
         <li>No rewire</li>
       </ul>
-      <a class="btn" href="${FREE_KEY_LINK}" target="_blank" rel="noopener">Get free key</a>
+      <button class="btn" id="m-free-paid" type="button">Select method</button>
     </article>
     <article class="price-card">
       <h3>Week</h3>
@@ -2131,7 +2275,7 @@ function pricingPage() {
         <li>Account rewire included</li>
         <li>Priority Discord support</li>
       </ul>
-      <a class="btn" href="${DISCORD_INVITE}" target="_blank" rel="noopener">Buy on Discord</a>
+      <button class="btn m-paid-btn" type="button">Select method</button>
     </article>
     <article class="price-card featured">
       <span class="tag">Popular</span>
@@ -2142,7 +2286,7 @@ function pricingPage() {
         <li>Account rewire included</li>
         <li>Best balance price / time</li>
       </ul>
-      <a class="btn btn-gold" href="${DISCORD_INVITE}" target="_blank" rel="noopener">Buy on Discord</a>
+      <button class="btn btn-gold m-paid-btn" type="button">Select method</button>
     </article>
     <article class="price-card">
       <h3>Year</h3>
@@ -2152,70 +2296,31 @@ function pricingPage() {
         <li>Account rewire included</li>
         <li>Best long-term value</li>
       </ul>
-      <a class="btn" href="${DISCORD_INVITE}" target="_blank" rel="noopener">Buy on Discord</a>
+      <button class="btn m-paid-btn" type="button">Select method</button>
     </article>
   </div>
   <p class="muted">See <a href="/tos">Terms of Service</a> for rewire, refunds, and key rules.</p>
-
-  <div class="card" style="margin-top:18px">
-    <h3>Redeem Game Pass → key</h3>
-    <p class="muted">1) Buy the pass · 2) Inventory = Everyone · 3) Redeem</p>
-    <label class="field">Roblox username</label>
-    <input id="rp_user" maxlength="20" placeholder="Username (not display name)" autocomplete="off"/>
-    <label class="field">Plan</label>
-    <select id="rp_plan">
-      <option value="week">Week (310 R$)</option>
-      <option value="month">Month (550 R$)</option>
-      <option value="year">Year (1100 R$)</option>
-    </select>
-    <label class="field" style="display:flex;gap:8px;align-items:center;margin-top:12px">
-      <input type="checkbox" id="rp_inv" style="width:auto"/>
-      My inventory is set to Everyone
-    </label>
-    <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px">
-      <a class="btn" id="rp_buy" href="https://www.roblox.com/game-pass/1963350769" target="_blank" rel="noopener">Open pass store</a>
-      <button type="button" class="btn btn-gold" id="rp_go">Redeem</button>
-    </div>
-    <p id="rp_out" class="muted" style="margin-top:12px;white-space:pre-wrap"></p>
-  </div>
   <script>
   (function(){
-    const stores = {
-      week: "https://www.roblox.com/game-pass/1963350769",
-      month: "https://www.roblox.com/game-pass/1965054742",
-      year: "https://www.roblox.com/game-pass/1966320456"
-    };
-    const planEl = document.getElementById("rp_plan");
-    const buy = document.getElementById("rp_buy");
-    if (planEl && buy) planEl.onchange = function(){ buy.href = stores[planEl.value] || stores.week; };
-    const go = document.getElementById("rp_go");
-    if (go) go.onclick = async function(){
-      const out = document.getElementById("rp_out");
-      const username = (document.getElementById("rp_user").value || "").trim();
-      const plan = planEl.value;
-      const inventory_public = document.getElementById("rp_inv").checked;
-      out.className = "muted";
-      out.textContent = "Checking...";
-      try {
-        const res = await fetch("/redeem/gamepass", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, plan, inventory_public })
-        });
-        const data = await res.json();
-        if (data.success && data.key) {
-          out.className = "ok";
-          out.textContent = (data.already_redeemed ? "Already redeemed\\n" : "OK\\n")
-            + "Key: " + data.key + "\\nPlan: " + (data.plan || plan);
-        } else {
-          out.className = "err";
-          out.textContent = (data.message || data.reason || res.status) + (data.store ? "\\n" + data.store : "");
-        }
-      } catch (e) {
-        out.className = "err";
-        out.textContent = String(e);
-      }
-    };
+    function freeModal() {
+      if (!window.ghMethods) return;
+      window.ghMethods('Get a free key', 'Pick where to complete the steps:', [
+        { label: 'Work.Ink', sub: '24h key · already set up', href: '${FREE_KEY_LINK}' },
+        { label: 'Linkvertise', sub: 'coming soon', locked: true, lockNote: 'Coming soon' }
+      ]);
+    }
+    function paidModal() {
+      if (!window.ghMethods) return;
+      window.ghMethods('Choose payment', 'Paid plans, week / month / year:', [
+        { label: 'Roblox Gamepass', sub: 'pay with Robux', locked: true, lockNote: 'Temporary locked' },
+        { label: 'Card payment', sub: 'via Discord ticket', href: '${DISCORD_INVITE}' }
+      ]);
+    }
+    var f = document.getElementById('m-free-paid');
+    if (f) f.addEventListener('click', freeModal);
+    document.querySelectorAll('.m-paid-btn').forEach(function(b) {
+      b.addEventListener('click', paidModal);
+    });
   })();
   </script>
 `, true);
