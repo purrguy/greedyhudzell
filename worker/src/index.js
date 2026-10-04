@@ -416,10 +416,11 @@ async function handleFinish(request, env, token) {
       <div class="step ok">✓ KEY READY</div>
       <label>Your key — click to copy</label>
       <div class="keybox" id="kbox">${key}</div>
-      <label style="margin-top:16px">Loader — run in your executor</label>
-      <div class="codeblock">
-        <div class="cb-head"><i></i><i></i><i></i><span>loader.lua</span><button class="cb-copy" id="ld-copy2" type="button">Copy</button></div>
+      <label style="margin-top:16px">Loader — tap the box to copy, run in your executor</label>
+      <div class="codeblock" id="ld-block2">
+        <div class="cb-head"><i></i><i></i><i></i><span>&#96;&#96;&#96;lua</span><button class="cb-copy" id="ld-copy2" type="button">Copy</button></div>
         <pre><code id="ld-code2">${loaderCode}</code></pre>
+        <div class="cb-hint">press anywhere to copy</div>
       </div>
       <script>(function(){
         function wire(boxId, btnId, getText, btnLabel) {
@@ -443,7 +444,7 @@ async function handleFinish(request, env, token) {
           if (b) b.addEventListener('click', doCopy);
         }
         wire('kbox', null, function(){ return document.getElementById('kbox').textContent; });
-        wire('ld-code2', 'ld-copy2', function(){ return document.getElementById('ld-code2').textContent; });
+        wire('ld-block2', 'ld-copy2', function(){ return document.getElementById('ld-code2').textContent; });
       })();</script>`
     )
   );
@@ -1873,7 +1874,7 @@ a:hover{text-decoration:underline}
 }
 .brand-logo{width:34px;height:34px;border-radius:10px;border:1px solid var(--gold);object-fit:cover;display:block}
 /* golden code block, markdown-fence style */
-.codeblock{background:#070707;border:1px solid var(--gold);border-radius:12px;overflow:hidden;margin-top:14px}
+.codeblock{background:#070707;border:1px solid var(--gold);border-radius:12px;overflow:hidden;margin-top:14px;max-width:100%;cursor:pointer}
 .codeblock .cb-head{display:flex;align-items:center;gap:7px;padding:9px 13px;border-bottom:1px solid rgba(201,162,39,.4)}
 .codeblock .cb-head i{width:11px;height:11px;border-radius:50%;background:#3a3a3a}
 .codeblock .cb-head i:nth-child(1){background:#ff5f57}
@@ -1882,7 +1883,9 @@ a:hover{text-decoration:underline}
 .codeblock .cb-head span{margin-left:6px;color:var(--muted);font-size:12px;font-family:ui-monospace,monospace}
 .codeblock .cb-copy{margin-left:auto;background:var(--bg2);border:1px solid var(--gold);color:var(--gold-soft);border-radius:8px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit}
 .codeblock .cb-copy:hover{background:var(--gold);color:#0a0a0a}
-.codeblock pre{padding:14px 15px;font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.65;color:var(--gold-soft);white-space:pre-wrap;word-break:break-all;margin:0}
+.codeblock pre{padding:14px 15px;font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.65;color:var(--gold-soft);white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere;overflow:hidden;margin:0;max-width:100%}
+.codeblock code{overflow-wrap:anywhere;word-break:break-all}
+.codeblock .cb-hint{font-size:11px;color:var(--muted);padding:0 15px 10px}
 /* method modal */
 .mback{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.68);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;padding:20px}
 .mback[hidden]{display:none}
@@ -2112,21 +2115,25 @@ function homePage() {
     </div>
     <div class="card">
       <h3 style="margin-bottom:8px">Loader</h3>
-      <div class="codeblock">
-        <div class="cb-head"><i></i><i></i><i></i><span>loader.lua</span><button class="cb-copy" id="ld-copy" type="button">Copy</button></div>
+      <div class="codeblock" id="ld-block">
+        <div class="cb-head"><i></i><i></i><i></i><span>&#96;&#96;&#96;lua</span><button class="cb-copy" id="ld-copy" type="button">Copy</button></div>
         <pre><code id="ld-code">loadstring(game:HttpGet("https://greedyhudzell.xyz/loader.lua"))()</code></pre>
+        <div class="cb-hint">press anywhere to copy</div>
       </div>
       <p class="muted" style="margin-top:12px"><a href="/guide">Guide</a> · <a href="/executors">Executors</a> · <a href="/status">Status</a></p>
     </div>
   <script>(function(){
     var b = document.getElementById('ld-copy');
-    if (b) b.addEventListener('click', function() {
+    var block = document.getElementById('ld-block');
+    function doCopy() {
       var t = document.getElementById('ld-code').textContent;
-      function done() { b.textContent = 'Copied!'; setTimeout(function(){ b.textContent = 'Copy'; }, 1500); }
+      function done() { if (b) { b.textContent = 'Copied!'; setTimeout(function(){ b.textContent = 'Copy'; }, 1500); } }
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(t).then(done, function() {});
       }
-    });
+    }
+    if (b) b.addEventListener('click', doCopy);
+    if (block) block.addEventListener('click', doCopy);
   })();</script>
   </div>
 <script>
