@@ -878,84 +878,84 @@ async function handleValidate(request, env) {
   }
   const qv = await endpointQuota(env, "validate", request, body, 2000);
   if (!qv.ok) return json({ valid: false, reason: qv.error }, 429);
-  const key = typeof body.key === "string" ? body.key.trim() : "";
   const username = typeof body.username === "string" ? body.username.trim() : "";
   const discordId = String(body.discord_id || body.discordId || "").replace(/\D/g, "") || null;
-  if (!key || !username) return json({ valid: false, reason: "missing_key_or_username" });
-  const record = await env.DB.prepare(`SELECT * FROM keys WHERE key = ? LIMIT 1`).bind(key).first();
-  if (!record) return json({ valid: false, reason: "invalid_key" });
-  if (record.revoked === 1) return json({ valid: false, reason: "revoked" });
-  if (Number(record.expires_at) <= now()) return json({ valid: false, reason: "expired" });
-  {
-    const ban = await isBanned(env, key, username, body.user_id || body.userId || body.roblox_id);
-    if (ban) {
-      return json({
-        valid: false,
-        reason: "banned",
-        message: ban.reason || "Key, username or userId is banned from GH.",
-      });
+  const hwid = typeof body.hwid === "string" ? body.hwid.trim().slice(0, 128) : "";
+  // keys: explicit list wins, single key appended for old loaders
+  let candidates = [];
+  if (Array.isArray(body.keys)) candidates = body.keys.filter((k) => typeof k === "string").map((k) => k.trim()).filter(Boolean);
+  if (typeof body.key === "string" && body.key.trim()) candidates.push(body.key.trim());
+  candidates = [...new Set(candidates)].slice(0, 10);
+  if (!username) return json({ valid: false, reason: "missing_key_or_username" });
+
+  // ---- 5.2.1: key-required script. No keys = no script, no free session. ----
+  if (candidates.length === 0) {
+    return json({ valid: false, reason: "missing_key", message: "Incorrect key/caught bypassing" });
+  }
+  // ---- look up every candidate, keep usable ones ----
+  // Key-only gate: revoked / expired rows are skipped here; if every known
+  // row was expired (or revoked) we report that distinctly so the loader can
+  // show "Key expired" instead of the generic incorrect-key message.
+  const usable = [];
+  let expiredFound = false;
+  let revokedFound = false;
+  for (const k of candidates) {
+    const record = await env.DB.prepare(`SELECT * FROM keys WHERE key = ? LIMIT 1`).bind(k).first();
+    if (!record) continue;
+    if (record.revoked === 1) { revokedFound = true; continue; }
+    if (Number(record.expires_at) <= now()) { expiredFound = true; continue; }
+    const ban = await isBanned(env, k, username, body.user_id || body.userId || body.roblox_id);
+    if (ban) return json({ valid: false, reason: "banned", message: ban.reason || "Banned from GH." });
+    usable.push(record);
+  }
+  if (usable.length === 0) {
+    if (expiredFound) {
+      return json({ valid: false, reason: "expired", message: "Key expired" });
     }
+    if (revokedFound) {
+      return json({ valid: false, reason: "revoked", message: "Key revoked" });
+    }
+    return json({ valid: false, reason: "invalid_key", message: "Incorrect key/caught bypassing" });
   }
 
-  // HWID bind (replaces username bind when the client sends hwid).
-  // First contact binds + auto-activates (no Discord needed); then strict match.
-  const hwid = typeof body.hwid === "string" ? body.hwid.trim().slice(0, 128) : "";
-  let hwidOk = false;
-  if (hwid) {
+  // ---- highest status key wins ----
+  usable.sort((a, b) => planRank(b.plan) - planRank(a.plan));
+  const record = usable[0];
+  const key = record.key;
+  const hwidFree = Number(record.hwid_free) === 1; // universal key: works on all HWIDs
+
+  // ---- HWID bind (first contact binds; then strict match; universal keys skip) ----
+  let hwidBoundNow = false;
+  if (!hwidFree && hwid) {
     if (!record.hwid) {
       try {
-        await env.DB.prepare(`UPDATE keys SET hwid = ?, username = ?, activated = 1 WHERE key = ?`).bind(hwid, username, key).run();
+        await env.DB.prepare(`UPDATE keys SET hwid = ?, username = ? WHERE key = ?`).bind(hwid, username, key).run();
       } catch {
         return json({ valid: false, reason: "bind_failed" });
       }
       record.hwid = hwid;
       record.username = username;
-      record.activated = 1;
-      hwidOk = true;
+      hwidBoundNow = true;
     } else if (record.hwid === hwid) {
-      hwidOk = true;
       if (record.username !== username) {
         try { await env.DB.prepare(`UPDATE keys SET username = ? WHERE key = ?`).bind(username, key).run(); } catch (_) {}
         record.username = username;
       }
     } else {
-      return json({ valid: false, reason: "hwid_mismatch", message: "Key is bound to another machine. Use /reset-hwid (once per 7 days)." });
+      return json({ valid: false, reason: "hwid_mismatch", message: "Incorrect key/caught bypassing" });
     }
   }
 
-  // Keys start inactive; Discord Verify sets activated = 1
-  // (HWID first-bind auto-activates above, so this only hits legacy keys)
-  // Legacy rows: activated NULL → allow if already executed/discord linked
-  const act = record.activated;
-  if (act === 0 || act === "0") {
-    return json({
-      valid: false,
-      reason: "not_activated",
-      message: "Key is inactive. Use Verify in Discord to activate.",
-    });
+  // Roblox username is informational only (HWID is the bind). Claim pending_*
+  // once, otherwise refresh best-effort — never fail validation on it.
+  if (String(record.username || "") !== username) {
+    try {
+      await env.DB.prepare(`UPDATE keys SET username = ? WHERE key = ?`).bind(username, key).run();
+      record.username = username;
+    } catch (_) {}
   }
 
-  // Roblox username bind: pending_* can claim once; otherwise must match
-  const isPending = String(record.username || "").startsWith("pending_");
-  if (record.username !== username) {
-    if (isPending) {
-      try {
-        await env.DB.prepare(`UPDATE keys SET username = ? WHERE key = ?`).bind(username, key).run();
-      } catch {
-        return json({ valid: false, reason: "bind_failed" });
-      }
-    } else {
-      return json({
-        valid: false,
-        reason: "username_mismatch",
-        bound_username: record.username,
-        message: "Key is bound to another Roblox account. Paid keys can /rewire.",
-      });
-    }
-  }
-
-  // Discord bind: informational only (HWID is the anti-share now).
-  // First send attaches; mismatches no longer reject.
+  // Discord bind: informational only, first send attaches
   if (!record.discord_id && discordId) {
     try {
       await env.DB.prepare(`UPDATE keys SET discord_id = ? WHERE key = ?`).bind(discordId, key).run();
@@ -964,21 +964,66 @@ async function handleValidate(request, env) {
 
   const timestamp = now();
   await env.DB.prepare(`UPDATE keys SET executed = 1, last_execution = ? WHERE key = ?`).bind(timestamp, key).run();
+  // first HWID bind is logged to Discord (same logs channel as handshake
+  // fails) with the FULL hwid so sellers can see which machine claimed it.
+  // Awaited but fully guarded: logging must never break validation.
+  if (hwidBoundNow) {
+    try {
+      const ch = env.DISCORD_LOGS_CHANNEL || "";
+      if (ch) {
+        const uid = String(body.user_id || body.userId || body.roblox_id || "").replace(/\D/g, "");
+        const content = "HWID bind | key `" + key + "` | user `" + username + "`"
+          + (uid ? " (" + uid + ")" : "")
+          + " | plan `" + (record.plan || "?") + "`"
+          + (hwidFree ? " | UNIVERSAL" : "")
+          + " | HWID `" + hwid + "`";
+        await discordApi(env, "POST", "/channels/" + ch + "/messages", { content: content.slice(0, 1900) });
+      }
+    } catch (_) {}
+  }
+  // explicit submit = fresh 24h entry (audit trail for re-entry policy)
+  if (hwid) {
+    try {
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS key_sessions (hwid TEXT NOT NULL, key TEXT NOT NULL, entered_at INTEGER NOT NULL, PRIMARY KEY (hwid, key))`
+      ).run();
+      await env.DB.prepare(
+        `INSERT INTO key_sessions (hwid, key, entered_at) VALUES (?, ?, ?)
+         ON CONFLICT(hwid, key) DO UPDATE SET entered_at = excluded.entered_at`
+      ).bind(hwid, key, timestamp).run();
+    } catch (_) {}
+  }
 
-  let discordBound = record.discord_id || discordId || null;
+  const testing = record.testing === 1;
+  const paid = isPaidPlan(record.plan, key);
+  const discordBound = record.discord_id || discordId || null;
+  let verified = await isGuildMember(env, discordBound);
+  if (!verified && hwid) {
+    try {
+      const link = await env.DB.prepare(`SELECT discord_id FROM hwid_discord WHERE hwid = ? LIMIT 1`).bind(hwid).first();
+      if (link && link.discord_id) verified = true;
+    } catch (_) {}
+  }
+  const script = await fetchSecretScript(env, testing);
   return json({
     valid: true,
+    key,
     expires_at: record.expires_at,
     plan: record.plan || "day",
     username: username,
     discord_id: discordBound,
     discord_linked: Boolean(discordBound),
-    paid: isPaidPlan(record.plan, key),
-    rewire_allowed: isPaidPlan(record.plan, key),
-    testing: record.testing === 1,
-    hwid_bound: Boolean(record.hwid || hwidOk),
+    member_verified: verified,
+    paid,
+    rewire_allowed: paid,
+    testing,
+    hwid_bound: Boolean(record.hwid),
+    hwid_free: hwidFree,
+    script: script.ok ? script.script : null,
+    script_error: script.ok ? null : script.reason,
   });
 }
+
 /* ===================== ADMIN ===================== */
 function adminAuthorized(request, env) {
   const auth = request.headers.get("Authorization");
@@ -1112,6 +1157,8 @@ async function handleAdminKey(request, env, key) {
     executed: record.executed === 1,
     last_execution: record.last_execution,
     testing: record.testing === 1,
+    hwid: record.hwid || null,
+    hwid_free: Number(record.hwid_free) === 1,
     status: record.revoked === 1 ? "REVOKED" : record.expires_at <= now() ? "EXPIRED" : "ACTIVE",
   });
 }
@@ -1134,46 +1181,59 @@ async function handleAdminGenerate(request, env) {
     }
   }
 
-  const key = generateKey();
+  const testing = body.testing === true || body.plan === "testing";
+  // universal key: works on all HWIDs (optional, off by default).
+  const hwidFree = body.hwid_free === true || body.hwidFree === true;
+  // custom keys: seller types the literal string. Strict charset so keys stay
+  // paste-safe and URL-safe; uniqueness enforced by PRIMARY KEY (duplicate
+  // insert returns a clean `duplicate` reason instead of a 500).
+  let key;
+  let custom = false;
+  if (typeof body.custom_key === "string" && body.custom_key.trim() !== "") {
+    custom = true;
+    key = body.custom_key.trim();
+    if (key.length < 8 || key.length > 64 || !/^[A-Za-z0-9_\-]+$/.test(key)) {
+      return json({ success: false, reason: "invalid_custom_key" }, 400);
+    }
+  } else {
+    key = testing ? generateTestingKey() : generateKey();
+  }
   const timestamp = now();
-  const expires = timestamp + planTtl(plan);
+  const expires = timestamp + planTtl(testing ? "year" : plan);
   const storedUser = username || ("pending_" + key.replace(/-/g, "").slice(0, 12));
 
+  // ensure the hwid_free column exists (older DBs predate migration 0006).
+  try { await env.DB.prepare(`ALTER TABLE keys ADD COLUMN hwid_free INTEGER`).run(); } catch (_) {}
   try {
     await env.DB.prepare(
-      `INSERT INTO keys (key, username, session_id, created_at, expires_at, revoked, executed, last_execution, plan, activated)
-       VALUES (?, ?, ?, ?, ?, 0, 0, NULL, ?, 0)`
+      `INSERT INTO keys (key, username, session_id, created_at, expires_at, revoked, executed, last_execution, plan, testing, hwid_free)
+       VALUES (?, ?, ?, ?, ?, 0, 0, NULL, ?, ?, ?)`
     )
-      .bind(key, storedUser, "admin:" + timestamp, timestamp, expires, plan)
+      .bind(key, storedUser, "admin:" + timestamp, timestamp, expires, testing ? "testing" : plan, testing ? 1 : 0, hwidFree ? 1 : 0)
       .run();
   } catch (e) {
-    // D1 without activated column yet
-    console.error("admin generate insert (activated):", String(e));
-    try {
-      await env.DB.prepare(
-        `INSERT INTO keys (key, username, session_id, created_at, expires_at, revoked, executed, last_execution, plan)
-         VALUES (?, ?, ?, ?, ?, 0, 0, NULL, ?)`
-      )
-        .bind(key, storedUser, "admin:" + timestamp, timestamp, expires, plan)
-        .run();
-    } catch (e2) {
-      console.error("admin generate insert:", String(e2));
-      return json({
-        success: false,
-        reason: "db_error",
-        message: String(e2 && e2.message ? e2.message : e2),
-      }, 500);
+    const msg = String((e && e.message) || e);
+    if (custom && /UNIQUE|PRIMARY|duplicate|already exists/i.test(msg)) {
+      return json({ success: false, reason: "duplicate", message: "That key string is already taken." }, 409);
     }
+    console.error("admin generate insert:", msg);
+    return json({
+      success: false,
+      reason: "db_error",
+      message: msg,
+    }, 500);
   }
 
   return json({
     success: true,
     key,
-    plan,
+    custom,
+    plan: testing ? "testing" : plan,
+    testing,
+    hwid_free: hwidFree,
     expires_at: expires,
     username: username || null,
     pending: !username,
-    activated: 0,
   });
 }
 /** Extend key by N days (un-revokes) */
@@ -1260,13 +1320,9 @@ async function handleAdminResetHwid(request, env) {
   const paid = isPaidPlan(record.plan, key);
   const week = 7 * 24 * 60 * 60;
   const last = Number(record.hwid_reset_at) || 0;
-  if (last) {
-    if (!paid) {
-      return json({ success: false, reason: "free_used", message: "Free keys get 1 HWID reset. Paid keys reset every 7 days." }, 400);
-    }
-    if (now() - last < week) {
-      return json({ success: false, reason: "reset_cooldown", reset_available_at: last + week }, 400);
-    }
+  // 5.2.0: free keys get 1 rebind, paid keys rebind unlimited (no cooldown)
+  if (last && !paid) {
+    return json({ success: false, reason: "free_used", message: "Free keys get 1 HWID rebind. Paid keys rebind unlimited." }, 400);
   }
   await env.DB.prepare(`UPDATE keys SET hwid = NULL, hwid_reset_at = ? WHERE key = ?`).bind(now(), key).run();
   return json({ success: true, key, reset_at: now() });
@@ -1573,6 +1629,20 @@ async function proxyGithub(file) {
   const response = await fetch(`${GH}/${file}`, { cf: { cacheTtl: 0, cacheEverything: false } });
   if (!response.ok) return plain(`${file} not found`, 404);
   return plain(await response.text(), 200);
+}
+
+/* 5.2.0: private gh-secret builds (loader + hub). Token never leaves the worker. */
+async function proxySecret(env, file) {
+  const token = env.GITHUB_TOKEN || "";
+  if (!token) return plain("hub not published", 503);
+  const repo = env.GH_SECRET_REPO || "purrguy/gh-secret";
+  const res = await fetch(`https://api.github.com/repos/${repo}/contents/${file}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.raw", "User-Agent": "greedyhudzell-worker" },
+  });
+  if (!res.ok) return plain(`${file} not found`, 404);
+  const text = await res.text();
+  if (!text || text.length < 40) return plain(`${file} empty`, 404);
+  return plain(text, 200);
 }
 
 /* ===================== OBFUSCATOR v2 (Shamir layer + API + long-bracket) ===================== */
@@ -2563,7 +2633,7 @@ function statusPage() {
       <tr><th>Component</th><th>Note</th></tr>
       <tr><td>Website</td><td>Online</td></tr>
       <tr><td>/validate</td><td>Key API</td></tr>
-      <tr><td>/loader.lua</td><td>GitHub proxy</td></tr>
+      <tr><td>/loader.lua</td><td>Private build v5.2.0 (key gate + hub in one)</td></tr>
       <tr><td>Work.ink free keys</td><td>Third-party flow</td></tr>
       <tr><td>Discord bot</td><td>Keys / verify / updates</td></tr>
     </table>
@@ -2643,7 +2713,7 @@ function guidePage() {
   <h1>Guide</h1>
   <p class="sub">Free key → loader → hub.</p>
   <div class="card">
-    <p><b>1.</b> Get a key (free Work.ink or paid on Discord).</p>
+    <p><b>1.</b> No key needed to run (free). Keys unlock paid; Member unlocks most features.</p>
     <p style="margin-top:8px"><b>2.</b> Run: <code>loadstring(game:HttpGet("https://greedyhudzell.xyz/loader.lua"))()</code></p>
     <p style="margin-top:8px"><b>3.</b> Enter key. Check status anytime on <a href="/home">Home</a>.</p>
     <p style="margin-top:8px"><b>4.</b> Stack overflow after obfuscation → use light/raw, not Full/VM.</p>
@@ -2900,6 +2970,65 @@ function isPaidPlan(plan, key) {
   if (typeof key === "string" && key.startsWith("GH-PAID-")) return true;
   return false;
 }
+
+/* ===================== 5.2.0 KEY AUTH ===================== */
+// plan rank: highest valid key wins (year > month > week > day; free = -1)
+function planRank(plan) {
+  const p = String(plan || "").toLowerCase();
+  if (p === "year") return 3;
+  if (p === "month") return 2;
+  if (p === "week") return 1;
+  if (p === "day") return 0;
+  return -1;
+}
+// long testing keys: GHT- + 48 chars, unmistakable vs normal GH- keys
+function generateTestingKey() {
+  const bytes = new Uint8Array(36);
+  crypto.getRandomValues(bytes);
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  let value = "";
+  for (const byte of bytes) value += alphabet[byte % alphabet.length];
+  return `GHT-${value}`;
+}
+// Discord Member check: linked discord_id must hold the Member role
+async function isGuildMember(env, discordId) {
+  const id = String(discordId || "").replace(/\D/g, "");
+  if (!id) return false;
+  // fast path: web-verify members table (written on authorize)
+  try {
+    const row = await env.DB.prepare(`SELECT discord_id FROM members WHERE discord_id = ? LIMIT 1`).bind(id).first();
+    if (row) return true;
+  } catch (_) {}
+  const guildId = env.DISCORD_GUILD_ID || "1422222409846620201";
+  const roleId = env.DISCORD_MEMBER_ROLE || "1445500571640402052";
+  try {
+    const r = await discordApi(env, "GET", `/guilds/${guildId}/members/${id}`, null);
+    if (!r.ok || !r.data || !Array.isArray(r.data.roles)) return false;
+    return r.data.roles.map(String).includes(String(roleId));
+  } catch {
+    return false;
+  }
+}
+// private repo script fetch (gh-secret). Needs GITHUB_TOKEN secret.
+// normal key -> greedy.lua, testing key -> greedytesting.lua
+async function fetchSecretScript(env, testing) {
+  const token = env.GITHUB_TOKEN || "";
+  if (!token) return { ok: false, reason: "no_github_token" };
+  const repo = env.GH_SECRET_REPO || "purrguy/gh-secret";
+  const file = testing ? (env.GH_SECRET_TESTING_FILE || "greedytesting.lua")
+                       : (env.GH_SECRET_FILE || "greedy.lua");
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/contents/${file}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.raw", "User-Agent": "greedyhudzell-worker" },
+    });
+    if (!res.ok) return { ok: false, reason: "github_" + res.status };
+    const text = await res.text();
+    if (!text || text.length < 40) return { ok: false, reason: "empty_script" };
+    return { ok: true, script: text, file };
+  } catch (e) {
+    return { ok: false, reason: "fetch_failed" };
+  }
+}
 function getDiscordBotToken(env) {
   return (
     env.DISCORD_BOT_TOKEN ||
@@ -3092,12 +3221,90 @@ async function handleOauthStart(request, env) {
   return Response.redirect(auth.toString(), 302);
 }
 
+/* 5.2.0: keyless web verify. Copy the link from the hub, authorize,
+   worker auto-joins the guild + grants Member + stores you in members. */
+/* 5.2.0: per-client verify links. Hub requests a fresh token every execute
+   (old tokens for the HWID are revoked), user opens it, authorizes, gets the
+   Verified role + HWID link. No refresh button needed. */
+async function handleVerifyLink(request, env) {
+  if (request.method !== "POST") return json({ ok: false }, 405);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false }, 400);
+  }
+  const hwid = typeof body.hwid === "string" ? body.hwid.trim().slice(0, 128) : "";
+  if (!hwid) return json({ ok: false, reason: "missing_hwid" }, 400);
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  const token = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  try {
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS verify_links (token TEXT PRIMARY KEY, hwid TEXT NOT NULL, created_at INTEGER NOT NULL)`
+    ).run();
+    await env.DB.prepare(`DELETE FROM verify_links WHERE hwid = ?`).bind(hwid).run();
+    await env.DB.prepare(
+      `INSERT INTO verify_links (token, hwid, created_at) VALUES (?, ?, ?)`
+    ).bind(token, hwid, now()).run();
+  } catch {
+    return json({ ok: false, reason: "db_error" }, 500);
+  }
+  return json({ ok: true, url: "https://greedyhudzell.xyz/verify/key/discord/" + token });
+}
+
+async function handleVerifyToken(request, env, token) {
+  token = String(token || "").slice(0, 140);
+  if (!/^[0-9a-f]{4,128}$/.test(token)) {
+    return html(`<h1>Bad verify link</h1><p>Copy a fresh link from the hub.</p>`, 400);
+  }
+  let row = null;
+  try {
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS verify_links (token TEXT PRIMARY KEY, hwid TEXT NOT NULL, created_at INTEGER NOT NULL)`
+    ).run();
+    row = await env.DB.prepare(`SELECT hwid FROM verify_links WHERE token = ? LIMIT 1`).bind(token).first();
+  } catch (_) {}
+  if (!row) {
+    return html(`<h1>Link expired or used</h1><p>Copy a fresh link from the hub (new one every execute).</p>`, 400);
+  }
+  const clientId = env.DISCORD_CLIENT_ID || env.CLIENT_ID || DEFAULT_DISCORD_CLIENT_ID;
+  if (!clientId) return html(`<h1>Server misconfigured</h1>`, 500);
+  const redirect = oauthRedirectUri(env, request);
+  const auth = new URL("https://discord.com/api/oauth2/authorize");
+  auth.searchParams.set("client_id", String(clientId));
+  auth.searchParams.set("redirect_uri", redirect);
+  auth.searchParams.set("response_type", "code");
+  auth.searchParams.set("scope", OAUTH_SCOPES);
+  auth.searchParams.set("state", "vfy:" + token);
+  auth.searchParams.set("prompt", "consent");
+  return Response.redirect(auth.toString(), 302);
+}
+
+async function handleWebVerify(request, env) {
+  const clientId = env.DISCORD_CLIENT_ID || env.CLIENT_ID || DEFAULT_DISCORD_CLIENT_ID;
+  if (!clientId) {
+    return html(`<h1>Server misconfigured</h1><p>DISCORD_CLIENT_ID secret required.</p>`, 500);
+  }
+  const redirect = oauthRedirectUri(env, request);
+  const auth = new URL("https://discord.com/api/oauth2/authorize");
+  auth.searchParams.set("client_id", String(clientId));
+  auth.searchParams.set("redirect_uri", redirect);
+  auth.searchParams.set("response_type", "code");
+  auth.searchParams.set("scope", OAUTH_SCOPES);
+  auth.searchParams.set("state", "web");
+  auth.searchParams.set("prompt", "consent");
+  return Response.redirect(auth.toString(), 302);
+}
+
 async function handleOauthCallback(request, env) {
   const url = new URL(request.url);
   // Discord returns ?code=...&state=...  (state is our discord_id)
   // Direct authorize links without state used to show "Missing code" — fixed.
   const code = url.searchParams.get("code");
-  let state = String(url.searchParams.get("state") || "").replace(/\D/g, "");
+  const rawState = String(url.searchParams.get("state") || "");
+  const webFlow = rawState === "web";
+  let state = rawState.replace(/\D/g, "");
   const err = url.searchParams.get("error");
   const errDesc = url.searchParams.get("error_description") || "";
   if (err) {
@@ -3169,6 +3376,21 @@ async function handleOauthCallback(request, env) {
     );
   }
   state = meId;
+  // 5.2.0 key-verify flow: state vfy:<token> links this Discord to a client HWID
+  let keyFlow = null;
+  if (rawState.startsWith("vfy:")) {
+    const token = rawState.slice(4, 140);
+    try {
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS verify_links (token TEXT PRIMARY KEY, hwid TEXT NOT NULL, created_at INTEGER NOT NULL)`
+      ).run();
+      const row = await env.DB.prepare(`SELECT hwid FROM verify_links WHERE token = ? LIMIT 1`).bind(token).first();
+      if (row && row.hwid) {
+        keyFlow = { token, hwid: String(row.hwid).slice(0, 128) };
+        try { await env.DB.prepare(`DELETE FROM verify_links WHERE token = ?`).bind(token).run(); } catch (_) {}
+      }
+    } catch (_) {}
+  }
 
   const gRes = await fetch("https://discord.com/api/users/@me/guilds", {
     headers: { Authorization: `Bearer ${access}` },
@@ -3193,15 +3415,47 @@ async function handleOauthCallback(request, env) {
   }
 
   // Auto-join our guild straight from OAuth (needs guilds.join scope).
-  // Member role itself is granted by Verify afterwards.
   let joined = false, joinErr = null;
+  let memberGiven = false, memberErr = null;
+  const joinGuild = env.DISCORD_GUILD_ID || "1422222409846620201";
+  const memberRole = env.DISCORD_MEMBER_ROLE || "1445500571640402052";
   try {
-    const joinGuild = env.DISCORD_GUILD_ID || "1422222409846620201";
     const jr = await discordApi(env, "PUT", `/guilds/${joinGuild}/members/${state}`, { access_token: access });
     joined = jr.ok || jr.status === 201 || jr.status === 204;
     if (!joined) joinErr = "discord_" + jr.status;
   } catch (e) {
     joinErr = String((e && e.message) || e).slice(0, 80);
+  }
+  // 5.2.0 web flow: Member role right here (no key needed), stored in members.
+  // key flow piggybacks the same grant, then links HWID <-> Discord.
+  if (webFlow || keyFlow) {
+    try {
+      const rr = await discordApi(env, "PUT", `/guilds/${joinGuild}/members/${state}/roles/${memberRole}`, null);
+      memberGiven = rr.ok || rr.status === 204;
+      if (!memberGiven) memberErr = "discord_" + rr.status;
+    } catch (e) {
+      memberErr = String((e && e.message) || e).slice(0, 80);
+    }
+    try {
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS members (discord_id TEXT PRIMARY KEY, username TEXT, verified_at INTEGER NOT NULL)`
+      ).run();
+      await env.DB.prepare(
+        `INSERT INTO members (discord_id, username, verified_at) VALUES (?, ?, ?)
+         ON CONFLICT(discord_id) DO UPDATE SET username = excluded.username, verified_at = excluded.verified_at`
+      ).bind(state, String(me.username || me.global_name || ""), Math.floor(Date.now() / 1000)).run();
+    } catch (_) {}
+    if (keyFlow) {
+      try {
+        await env.DB.prepare(
+          `CREATE TABLE IF NOT EXISTS hwid_discord (hwid TEXT PRIMARY KEY, discord_id TEXT NOT NULL, verified_at INTEGER NOT NULL)`
+        ).run();
+        await env.DB.prepare(
+          `INSERT INTO hwid_discord (hwid, discord_id, verified_at) VALUES (?, ?, ?)
+           ON CONFLICT(hwid) DO UPDATE SET discord_id = excluded.discord_id, verified_at = excluded.verified_at`
+        ).bind(keyFlow.hwid, state, Math.floor(Date.now() / 1000)).run();
+      } catch (_) {}
+    }
   }
 
   return html(
@@ -3210,7 +3464,9 @@ async function handleOauthCallback(request, env) {
     <p>Discord <b>${me.username || state}</b> authorized.</p>
     <p>Servers seen: <b>${guildIds.length}</b></p>
     <p>${joined ? "Joined the Greedy Hudzell server." : "Auto-join: " + (joinErr || "already a member") + ". If you are not in, use the invite."}</p>
-    <p>Return to Discord and press <b>Verify</b> again.</p>
+    ${(webFlow || keyFlow)
+      ? `<p>${memberGiven ? "Verified role granted. This machine is now verified — features unlock in the hub." : "Verified role: " + (memberErr || "already present") + ". This machine is linked."}</p>`
+      : `<p>Return to Discord and press <b>Verify</b> again.</p>`}
     <p style="opacity:.6;font-size:12px">You can close this tab.</p>
     <script>try{window.close()}catch(e){}</script>
     </body></html>`,
@@ -3823,6 +4079,40 @@ async function handleCreateWebhook(request, env) {
   return json({ ok: true, url: urlWh });
 }
 
+/* 5.2.0: handshake-failure log. Client keeps running (script is free),
+   but the attempt is recorded + forwarded to the Discord logs channel. */
+async function handleHandshakeFail(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false }, 400);
+  }
+  const hwid = typeof body.hwid === "string" ? body.hwid.trim().slice(0, 128) : "";
+  const username = typeof body.username === "string" ? body.username.trim().slice(0, 32) : "";
+  const userId = String(body.user_id || body.userId || body.roblox_id || "").replace(/\D/g, "").slice(0, 20);
+  const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, 128) : "unknown";
+  const key = typeof body.key === "string" ? body.key.trim().slice(0, 80) : "";
+  try {
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS security_events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, hwid TEXT, username TEXT, key TEXT, reason TEXT, created_at INTEGER NOT NULL)`
+    ).run();
+    try { await env.DB.prepare(`ALTER TABLE security_events ADD COLUMN user_id TEXT`).run(); } catch (_) {}
+    await env.DB.prepare(
+      `INSERT INTO security_events (kind, hwid, username, key, reason, created_at, user_id) VALUES ('handshake_fail', ?, ?, ?, ?, ?, ?)`
+    ).bind(hwid, username, key, reason, now(), userId).run();
+  } catch (_) {}
+  try {
+    const ch = env.DISCORD_LOGS_CHANNEL || "";
+    if (ch && (env.DISCORD_BOT_TOKEN || env.DISCORD_TOKEN || env.BOT_TOKEN)) {
+      const content = "Handshake fail | user `" + (username || "?") + "` (" + (userId || "?") + ")"
+        + " | key `" + (key || "none") + "` | HWID `" + (hwid || "?").slice(0, 16) + "` | " + reason;
+      await discordApi(env, "POST", "/channels/" + ch + "/messages", { content: content.slice(0, 1900) });
+    }
+  } catch (_) {}
+  return json({ ok: true });
+}
+
 async function handleSessionJoin(request, env) {
   let body;
   try {
@@ -3878,6 +4168,10 @@ export default {
         return html(homePage());
       }
       if (request.method === "GET" && path === "/status") return html(statusPage());
+      if (request.method === "GET" && path === "/verify") return await handleWebVerify(request, env);
+      if (request.method === "POST" && path === "/api/verify-link") return await handleVerifyLink(request, env);
+      const vfyMatch = path.match(/^\/verify\/key\/discord\/([0-9a-f]{4,128})$/);
+      if (request.method === "GET" && vfyMatch) return await handleVerifyToken(request, env, vfyMatch[1]);
       if (request.method === "GET" && (path === "/executors" || path === "/executor")) return html(executorsPage());
       if (request.method === "GET" && path === "/guide") return html(guidePage());
       if (request.method === "GET" && path === "/pricing") return html(pricingPage());
@@ -3885,8 +4179,8 @@ export default {
       if (request.method === "GET" && path === "/api") return html(apiPage());
 
       // Lua proxies
-      if (path === "/loader.lua") return proxyGithub("greedyloader.lua");
-      if (path === "/script.lua") return proxyGithub("greedy.lua");
+      if (path === "/loader.lua") return proxySecret(env, "greedyloader.lua");
+      if (path === "/script.lua") return plain("gone: hub ships inside /validate since 5.2.0", 410);
       if (path === "/library.lua") return proxyGithub("greedylibrary.lua");
       if (path === "/modules.lua") return proxyGithub("greedymodules.lua");
       
@@ -4011,6 +4305,7 @@ export default {
       if (request.method === "POST" && path === "/admin/message") return await handleAdminMessage(request, env);
       if (request.method === "POST" && path === "/api/discord/create-webhook") return await handleCreateWebhook(request, env);
       if (request.method === "POST" && path === "/api/session/join") return await handleSessionJoin(request, env);
+      if (request.method === "POST" && path === "/api/session/handshake-fail") return await handleHandshakeFail(request, env);
       if (request.method === "GET" && path === "/admin/stats") return await handleAdminStats(request, env);
       if (request.method === "GET" && (path === "/admin/keys-by-discord" || path === "/admin/keys")) {
         return await handleAdminKeysByDiscord(request, env);
