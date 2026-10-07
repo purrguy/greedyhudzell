@@ -33,10 +33,11 @@ CREATE TABLE IF NOT EXISTS obf_grants (
 );
 CREATE INDEX IF NOT EXISTS idx_obf_grants_key ON obf_grants(license_key);
 
--- Plans were written by INSERTs but the column never existed (inserts fell
--- back silently, so every license read as "day"). API keys inherit the real
--- plan from here; pre-existing rows correctly stay 'day'.
-ALTER TABLE keys ADD COLUMN plan TEXT NOT NULL DEFAULT 'day';
+-- NOTE (2026-10-07): prod already carries keys.plan (added out-of-band), so
+-- the ALTER below was removed — it aborted the whole migration on prod
+-- (duplicate column: plan) and blocked these tables. Tables are also
+-- self-created at runtime (CREATE TABLE IF NOT EXISTS in index.js).
+-- Fresh DBs: keys.plan is expected to exist; all reads fall back to 'day'.
 CREATE INDEX IF NOT EXISTS idx_keys_plan ON keys(plan);
 
 CREATE TABLE IF NOT EXISTS obf_cache (
