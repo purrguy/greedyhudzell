@@ -114,6 +114,383 @@ function generateKey() {
   for (const byte of bytes) value += alphabet[byte % alphabet.length];
   return `GH-${value.slice(0, 4)}-${value.slice(4, 8)}-${value.slice(8, 12)}`;
 }
+
+/* ===================== API KEYS + OBFUSCATOR QUOTA =====================
+ * API keys inherit the plan of the license that created them. Quota for
+ * /api/obfuscate resolves: api key > license key > anonymous IP. Work.ink
+ * step1+step2 sessions grant +1/day. Admins top up licenses via grants.
+ */
+const OBF_PLAN_LIMITS = { free: 2, day: 2, week: 10, month: 30, year: 50, lifetime: 50, paid: 50 };
+const OBF_ANON_LIMIT = 1;
+const OBF_KEY_SCOPES = ["obfuscate", "validate", "stats"];
+const OBF_MAX_KEYS_PER_LICENSE = 10;
+
+function obfDay(t) {
+  return new Date(t * 1000).toISOString().slice(0, 10);
+}
+
+let _obfMigrated = false;
+async function ensureObfTables(env) {
+  if (_obfMigrated) return;
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', license_key TEXT,
+        plan TEXT NOT NULL DEFAULT 'day', key_hash TEXT NOT NULL UNIQUE,
+        prefix TEXT NOT NULL, scopes TEXT NOT NULL DEFAULT 'obfuscate,validate,stats',
+        daily_limit INTEGER, expires_at INTEGER, revoked INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL, last_used_at INTEGER)`),
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS obf_usage (
+        identity TEXT NOT NULL, endpoint TEXT NOT NULL DEFAULT '', day TEXT NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (identity, endpoint, day))`),
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS obf_grants (
+        id TEXT PRIMARY KEY, license_key TEXT NOT NULL, amount INTEGER NOT NULL,
+        expires_at INTEGER, granted_by TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)`),
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS obf_cache (
+        code_hash TEXT PRIMARY KEY, output TEXT NOT NULL, out_chars INTEGER NOT NULL,
+        preset TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)`),
+    ]);
+    try {
+      await env.DB.prepare(`ALTER TABLE keys ADD COLUMN plan TEXT NOT NULL DEFAULT 'day'`).run();
+    } catch {}
+    try {
+      await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_obf_grants_key ON obf_grants(license_key)`).run();
+    } catch {}
+    _obfMigrated = true;
+  } catch {}
+}
+
+async function resolveApiKey(request, env, needScope) {
+  const hdr = request.headers.get("X-API-Key") || "";
+  const auth = request.headers.get("Authorization") || "";
+  let supplied = hdr.trim();
+  if (!supplied && auth.startsWith("Bearer ghsk_")) supplied = auth.slice(7).trim();
+  if (!supplied) return null;
+  const h = await sha256("ghsk|" + supplied);
+  let row = null;
+  try {
+    row = await env.DB.prepare(`SELECT * FROM api_keys WHERE key_hash = ? LIMIT 1`).bind(h).first();
+  } catch { return { error: "api_unavailable" }; }
+  if (!row || row.revoked === 1) return { error: "bad_api_key" };
+  if (row.expires_at && Number(row.expires_at) <= now()) return { error: "api_key_expired" };
+  const scopes = String(row.scopes || "").split(",").map(s => s.trim()).filter(Boolean);
+  if (needScope && !scopes.includes(needScope)) return { error: "scope_denied" };
+  try {
+    await env.DB.prepare(`UPDATE api_keys SET last_used_at = ? WHERE id = ?`).bind(now(), row.id).run();
+  } catch {}
+  return { row, scopes };
+}
+
+async function resolveObfIdentity(request, env, body) {
+  // 1) API key (header X-API-Key / Bearer ghsk_... / body.api_key)
+  let supplied = ((body && body.api_key) || "").trim();
+  if (!supplied) {
+    const hdr = request.headers.get("X-API-Key") || "";
+    const auth = request.headers.get("Authorization") || "";
+    supplied = hdr.trim() || (auth.startsWith("Bearer ghsk_") ? auth.slice(7).trim() : "");
+  }
+  if (supplied) {
+    const h = await sha256("ghsk|" + supplied);
+    let row = null;
+    try {
+      row = await env.DB.prepare(`SELECT * FROM api_keys WHERE key_hash = ? LIMIT 1`).bind(h).first();
+    } catch { return { error: "api_unavailable", status: 500 }; }
+    if (!row || row.revoked === 1) return { error: "bad_api_key", status: 401 };
+    if (row.expires_at && Number(row.expires_at) <= now()) return { error: "api_key_expired", status: 403 };
+    const scopes = String(row.scopes || "").split(",").map(s => s.trim()).filter(Boolean);
+    if (!scopes.includes("obfuscate")) return { error: "scope_denied", status: 403 };
+    try {
+      await env.DB.prepare(`UPDATE api_keys SET last_used_at = ? WHERE id = ?`).bind(now(), row.id).run();
+    } catch {}
+    return { kind: "api", id: "api:" + row.id, plan: row.plan || "day", apiRow: row };
+  }
+  // 2) license key in body
+  const lic = (body && body.license_key ? String(body.license_key) : "").trim();
+  if (lic) {
+    let rec = null;
+    try {
+      rec = await env.DB.prepare(`SELECT * FROM keys WHERE key = ? LIMIT 1`).bind(lic).first();
+    } catch { return { error: "api_unavailable", status: 500 }; }
+    if (!rec || rec.revoked === 1 || Number(rec.expires_at) <= now()) {
+      return { error: "bad_license", status: 403 };
+    }
+    return { kind: "license", id: "lic:" + lic, plan: rec.plan || "day" };
+  }
+  // 3) anonymous IP
+  const ip = getClientIP(request) || "?";
+  return { kind: "ip", id: "ip:" + await sha256("ip|" + ip), plan: "free", anon: true };
+}
+
+async function obfAllowance(env, ident, request) {
+  const t = now();
+  const day = obfDay(t);
+  let limit = ident.kind === "ip" ? OBF_ANON_LIMIT : (OBF_PLAN_LIMITS[ident.plan] ?? OBF_PLAN_LIMITS.day);
+  if (ident.kind === "api" && ident.apiRow && ident.apiRow.daily_limit != null) {
+    const cap = Number(ident.apiRow.daily_limit);
+    if (Number.isFinite(cap) && cap > 0) limit = Math.min(limit, Math.floor(cap));
+  }
+  let bonus = 0, bonusReason = null;
+  // Work.ink bonus: a session that completed both steps grants +1 today.
+  try {
+    const sid = getCookie(request, "GH_SESSION");
+    if (sid && ident.kind !== "api") {
+      const s = await env.DB.prepare(
+        `SELECT step1, step2 FROM sessions WHERE session_id = ? LIMIT 1`
+      ).bind(sid).first();
+      if (s && Number(s.step1) === 1 && Number(s.step2) === 1) {
+        bonus = 1; bonusReason = "workink";
+      }
+    }
+  } catch {}
+  let granted = 0;
+  const grantKey = ident.kind === "api" ? (ident.apiRow.license_key || null)
+    : ident.kind === "license" ? ident.id.slice(4) : null;
+  if (grantKey) {
+    try {
+      const g = await env.DB.prepare(
+        `SELECT COALESCE(SUM(amount),0) AS s FROM obf_grants WHERE license_key = ? AND (expires_at IS NULL OR expires_at > ?)`
+      ).bind(grantKey, t).first();
+      granted = Number(g?.s || 0);
+    } catch {}
+  }
+  const total = limit + bonus + granted;
+  let used = 0;
+  try {
+    const r = await env.DB.prepare(
+      `SELECT used FROM obf_usage WHERE identity = ? AND endpoint = 'obfuscate' AND day = ?`
+    ).bind(ident.id, day).first();
+    used = Number(r?.used || 0);
+  } catch {}
+  if (used >= total) return { ok: false, limit: total, used, bonus: bonusReason, plan: ident.plan };
+  return { ok: true, limit: total, used, left: total - used - 1, bonus: bonusReason, plan: ident.plan, day };
+}
+
+async function obfRecordUse(env, ident, day) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO obf_usage (identity, endpoint, day, used) VALUES (?, 'obfuscate', ?, 1)
+       ON CONFLICT(identity, endpoint, day) DO UPDATE SET used = used + 1`
+    ).bind(ident.id, day).run();
+  } catch {}
+}
+
+async function endpointQuota(env, endpoint, request, body, keyLimit, ipLimit) {
+  // Optional API-key lane on validate/stats: counted generously per key,
+  // strict per IP. Anonymous behavior is unchanged (no quota).
+  let supplied = ((body && body.api_key) || "").trim();
+  if (!supplied) {
+    const hdr = request.headers.get("X-API-Key") || "";
+    const auth = request.headers.get("Authorization") || "";
+    supplied = hdr.trim() || (auth.startsWith("Bearer ghsk_") ? auth.slice(7).trim() : "");
+  }
+  if (!supplied) return { ok: true, keyed: false };
+  const r = await resolveApiKey(request, env, endpoint);
+  if (r && r.error) return { ok: false, error: r.error };
+  if (!r) return { ok: true, keyed: false };
+  const day = obfDay(now());
+  const ident = "api:" + r.row.id;
+  let used = 0;
+  try {
+    const q = await env.DB.prepare(
+      `SELECT used FROM obf_usage WHERE identity = ? AND endpoint = ? AND day = ?`
+    ).bind(ident, endpoint, day).first();
+    used = Number(q?.used || 0);
+  } catch {}
+  if (used >= keyLimit) return { ok: false, error: "daily_limit" };
+  try {
+    await env.DB.prepare(
+      `INSERT INTO obf_usage (identity, endpoint, day, used) VALUES (?, ?, ?, 1)
+       ON CONFLICT(identity, endpoint, day) DO UPDATE SET used = used + 1`
+    ).bind(ident, endpoint, day).run();
+  } catch {}
+  return { ok: true, keyed: true };
+}
+
+function newApiSecret() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return "ghsk_" + [...bytes].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function validLicenseForApi(env, lic) {
+  if (!lic) return null;
+  let rec = null;
+  try {
+    rec = await env.DB.prepare(`SELECT * FROM keys WHERE key = ? LIMIT 1`).bind(lic).first();
+  } catch { return null; }
+  if (!rec || rec.revoked === 1 || Number(rec.expires_at) <= now()) return null;
+  return rec;
+}
+
+// POST /api/keys {license_key, name?, scopes?, daily_limit?, expires_at?}
+async function handleApiKeyCreate(request, env) {
+  await ensureObfTables(env);
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400); }
+  const lic = String(body.license_key || "").trim();
+  const rec = await validLicenseForApi(env, lic);
+  if (!rec) return json({ ok: false, error: "bad_license" }, 403);
+  const plan = rec.plan || "day";
+  const planMax = OBF_PLAN_LIMITS[plan] ?? OBF_PLAN_LIMITS.day;
+  let scopes = ["obfuscate", "validate", "stats"];
+  if (Array.isArray(body.scopes) && body.scopes.length) {
+    scopes = body.scopes.map(s => String(s).trim()).filter(s => OBF_KEY_SCOPES.includes(s));
+    if (!scopes.length) return json({ ok: false, error: "bad_scopes" }, 400);
+  }
+  let dailyLimit = null;
+  if (body.daily_limit != null && body.daily_limit !== "") {
+    dailyLimit = Math.floor(Number(body.daily_limit));
+    if (!Number.isFinite(dailyLimit) || dailyLimit < 1 || dailyLimit > planMax) {
+      return json({ ok: false, error: "bad_limit", detail: `1..${planMax} on ${plan}` }, 400);
+    }
+  }
+  let expiresAt = null;
+  if (body.expires_at != null && body.expires_at !== "") {
+    expiresAt = Math.floor(Number(body.expires_at));
+    if (!Number.isFinite(expiresAt) || expiresAt <= now()) {
+      return json({ ok: false, error: "bad_expiry" }, 400);
+    }
+  }
+  try {
+    const n = await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM api_keys WHERE license_key = ? AND revoked = 0`
+    ).bind(lic).first();
+    if (Number(n?.c || 0) >= OBF_MAX_KEYS_PER_LICENSE) {
+      return json({ ok: false, error: "too_many_keys" }, 400);
+    }
+  } catch {}
+  const secret = newApiSecret();
+  const id = randomString(8);
+  const prefix = secret.slice(0, 13);
+  const name = String(body.name || "api key").slice(0, 40) || "api key";
+  try {
+    await env.DB.prepare(
+      `INSERT INTO api_keys (id, name, license_key, plan, key_hash, prefix, scopes, daily_limit, expires_at, revoked, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+    ).bind(id, name, lic, plan, await sha256("ghsk|" + secret), prefix,
+      scopes.join(","), dailyLimit, expiresAt, now()).run();
+  } catch (e) {
+    return json({ ok: false, error: "create_failed" }, 500);
+  }
+  return json({ ok: true, id, api_key: secret, prefix, plan, scopes,
+    daily_limit: dailyLimit, expires_at: expiresAt });
+}
+
+// GET /api/keys?license_key=…
+async function handleApiKeyList(request, env) {
+  await ensureObfTables(env);
+  const url = new URL(request.url);
+  const lic = (url.searchParams.get("license_key") || "").trim();
+  const rec = await validLicenseForApi(env, lic);
+  if (!rec) return json({ ok: false, error: "bad_license" }, 403);
+  let rows = [];
+  try {
+    const r = await env.DB.prepare(
+      `SELECT id, name, plan, prefix, scopes, daily_limit, expires_at, revoked, created_at, last_used_at
+       FROM api_keys WHERE license_key = ? ORDER BY created_at DESC`
+    ).bind(lic).all();
+    rows = r.results || [];
+  } catch {}
+  return json({ ok: true, plan: rec.plan || "day",
+    plan_max: OBF_PLAN_LIMITS[rec.plan] ?? OBF_PLAN_LIMITS.day,
+    keys: rows.map(k => ({ ...k })) });
+}
+
+async function handleApiKeyMute(request, env, mutate) {
+  await ensureObfTables(env);
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400); }
+  const lic = String(body.license_key || "").trim();
+  const rec = await validLicenseForApi(env, lic);
+  if (!rec) return json({ ok: false, error: "bad_license" }, 403);
+  const id = String(body.id || "").trim();
+  if (!id) return json({ ok: false, error: "missing_id" }, 400);
+  let row = null;
+  try {
+    row = await env.DB.prepare(`SELECT * FROM api_keys WHERE id = ? AND license_key = ? LIMIT 1`).bind(id, lic).first();
+  } catch {}
+  if (!row) return json({ ok: false, error: "unknown_key" }, 404);
+  const out = await mutate(env, row, body, rec);
+  return out;
+}
+
+// POST /api/keys/revoke {license_key, id}
+async function handleApiKeyRevoke(request, env) {
+  return handleApiKeyMute(request, env, async (env2, row) => {
+    await env2.DB.prepare(`UPDATE api_keys SET revoked = 1 WHERE id = ?`).bind(row.id).run();
+    return json({ ok: true, id: row.id, revoked: true });
+  });
+}
+
+// POST /api/keys/rules {license_key, id, daily_limit?, scopes?, expires_at?}
+async function handleApiKeyRules(request, env) {
+  return handleApiKeyMute(request, env, async (env2, row, body, rec) => {
+    const planMax = OBF_PLAN_LIMITS[rec.plan] ?? OBF_PLAN_LIMITS.day;
+    const patch = {};
+    if (body.daily_limit !== undefined) {
+      if (body.daily_limit === null || body.daily_limit === "") {
+        patch.daily_limit = null;
+      } else {
+        const v = Math.floor(Number(body.daily_limit));
+        if (!Number.isFinite(v) || v < 1 || v > planMax) {
+          return json({ ok: false, error: "bad_limit", detail: `1..${planMax} on ${rec.plan}` }, 400);
+        }
+        patch.daily_limit = v;
+      }
+    }
+    if (body.scopes !== undefined) {
+      if (!Array.isArray(body.scopes) || !body.scopes.length) {
+        return json({ ok: false, error: "bad_scopes" }, 400);
+      }
+      const scopes = body.scopes.map(s => String(s).trim()).filter(s => OBF_KEY_SCOPES.includes(s));
+      if (!scopes.length) return json({ ok: false, error: "bad_scopes" }, 400);
+      patch.scopes = scopes.join(",");
+    }
+    if (body.expires_at !== undefined) {
+      if (body.expires_at === null || body.expires_at === "") {
+        patch.expires_at = null;
+      } else {
+        const v = Math.floor(Number(body.expires_at));
+        if (!Number.isFinite(v) || v <= now()) return json({ ok: false, error: "bad_expiry" }, 400);
+        patch.expires_at = v;
+      }
+    }
+    const keys = Object.keys(patch);
+    if (!keys.length) return json({ ok: false, error: "nothing_to_change" }, 400);
+    await env2.DB.prepare(
+      `UPDATE api_keys SET ${keys.map(k => k + " = ?").join(", ")} WHERE id = ?`
+    ).bind(...keys.map(k => patch[k]), row.id).run();
+    return json({ ok: true, id: row.id, ...patch });
+  });
+}
+
+// POST /admin/obf-grant {license_key, amount, days} — ADMIN_SECRET only.
+// days = 0 (or omitted) means never expires.
+async function handleAdminObfGrant(request, env) {
+  if (!adminAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
+  await ensureObfTables(env);
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400); }
+  const lic = String(body.license_key || "").trim();
+  const amount = Math.floor(Number(body.amount));
+  if (!lic) return json({ ok: false, error: "missing_license" }, 400);
+  if (!Number.isFinite(amount) || amount < 1 || amount > 10000) {
+    return json({ ok: false, error: "bad_amount" }, 400);
+  }
+  let days = body.days === undefined ? 0 : Math.floor(Number(body.days));
+  if (!Number.isFinite(days) || days < 0) return json({ ok: false, error: "bad_days" }, 400);
+  const expires = days > 0 ? now() + days * 86400 : null;
+  const id = randomString(8);
+  try {
+    await env.DB.prepare(
+      `INSERT INTO obf_grants (id, license_key, amount, expires_at, granted_by, created_at)
+       VALUES (?, ?, ?, ?, 'admin', ?)`
+    ).bind(id, lic, amount, expires, now()).run();
+  } catch (e) {
+    return json({ ok: false, error: "grant_failed" }, 500);
+  }
+  return json({ ok: true, id, license_key: lic, amount, expires_at: expires });
+}
 function cookie(name, value, maxAge) {
   return `${name}=${encodeURIComponent(value)}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`;
 }
@@ -499,6 +876,8 @@ async function handleValidate(request, env) {
   } catch {
     return json({ valid: false, reason: "invalid_json" }, 400);
   }
+  const qv = await endpointQuota(env, "validate", request, body, 2000);
+  if (!qv.ok) return json({ valid: false, reason: qv.error }, 429);
   const key = typeof body.key === "string" ? body.key.trim() : "";
   const username = typeof body.username === "string" ? body.username.trim() : "";
   const discordId = String(body.discord_id || body.discordId || "").replace(/\D/g, "") || null;
@@ -1725,10 +2104,13 @@ function obfuscatePage(siteName) {
     </div>
     <label class="f">Source</label>
     <textarea id="code" class="f" style="width:100%;min-height:220px;margin-bottom:10px;padding:12px;border-radius:8px;background:var(--bg2);color:var(--text);border:1px solid var(--border);font-family:ui-monospace,monospace" placeholder="Paste Lua source"></textarea>
-    <div style="display:flex;flex-wrap:wrap;gap:8px">
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
       <button type="button" class="btn btn-gold" id="go">Obfuscate</button>
       <button type="button" class="btn" id="copy">Copy output</button>
+      <span id="quota" class="muted"></span>
     </div>
+    <label class="f" style="margin-top:10px">License key <span class="muted">(optional — raises your daily limit)</span></label>
+    <input type="text" id="lickey" placeholder="GH-XXXX-XXXX-XXXX" autocomplete="off" style="max-width:320px"/>
     <p id="status" class="muted" style="margin-top:10px"></p>
     <label class="f" style="margin-top:12px">Output</label>
     <textarea id="out" readonly class="f" style="width:100%;min-height:180px;padding:12px;border-radius:8px;background:var(--bg2);color:var(--text);border:1px solid var(--border);font-family:ui-monospace,monospace"></textarea>
@@ -1770,7 +2152,10 @@ function obfuscatePage(siteName) {
     document.getElementById("go").onclick = async function(){
       const code = document.getElementById("code").value;
       const statusEl = document.getElementById("status");
+      const quotaEl = document.getElementById("quota");
       const out = document.getElementById("out");
+      const licEl = document.getElementById("lickey");
+      const lickey = licEl && licEl.value.trim() ? licEl.value.trim() : undefined;
       if (!code || code.trim().length < 2) {
         statusEl.className = "err";
         statusEl.textContent = "Empty source";
@@ -1783,17 +2168,23 @@ function obfuscatePage(siteName) {
         const res = await fetch("/api/obfuscate", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ preset: preset.value, options: collectOptions(), code: code })
+          body: JSON.stringify({ preset: preset.value, options: collectOptions(), code: code, license_key: lickey })
         });
         const data = await res.json();
         if (!data.ok) {
           statusEl.className = "err";
-          statusEl.textContent = data.error || res.status;
+          statusEl.textContent = data.error === "daily_limit"
+            ? "Daily limit reached (" + (data.used || "?") + "/" + (data.limit || "?") + "). " + (data.reset_hint || "")
+            : (data.error || res.status);
           return;
         }
         out.value = data.code || "";
         statusEl.className = "ok";
         statusEl.textContent = "OK · " + (data.mode||"") + " · " + (data.code||"").length + " chars · " + (data.note||"");
+        if (data.left_today !== undefined) {
+          quotaEl.textContent = data.left_today + " left today · plan " + (data.plan || "?")
+            + (data.bonus ? " · +1 Work.ink bonus 🎁" : "");
+        }
       } catch (e) {
         statusEl.className = "err";
         statusEl.textContent = String(e);
@@ -1819,6 +2210,7 @@ function siteNav(active) {
     ["executors", "/executors", "Executors"],
     ["guide", "/guide", "Guide"],
     ["status", "/status", "Status"],
+    ["api", "/api", "API"],
     ["tos", "/tos", "ToS"],
   ];
   return items
@@ -2257,6 +2649,155 @@ function guidePage() {
     <p style="margin-top:8px"><b>4.</b> Stack overflow after obfuscation → use light/raw, not Full/VM.</p>
   </div>
 `);
+}
+
+function apiPage() {
+  return siteShell("API", "api", `
+  <div class="badge">Developers</div>
+  <h1>API access</h1>
+  <p class="sub">Keys inherit your license plan (free: 2 obfuscations/day · week: 10 · month: 30 · year: 50). Complete both Work.ink steps for +1/day. Never expires unless you revoke it.</p>
+  <div class="card">
+    <h3 style="margin-bottom:8px">Your license key</h3>
+    <p class="muted">Paste a valid license key to manage its API keys. The key itself is never stored — only checked.</p>
+    <div class="key-input-group">
+      <input type="text" id="api-lic" placeholder="GH-XXXX-XXXX-XXXX" autocomplete="off"/>
+      <button id="api-load" type="button">Unlock</button>
+    </div>
+    <p id="api-plan" class="muted" style="margin-top:10px"></p>
+  </div>
+  <div class="card" id="api-mgr" hidden>
+    <div class="panel-head"><h3>API keys</h3><span class="tag" id="api-plan-tag">plan</span></div>
+    <div class="key-input-group">
+      <input type="text" id="api-name" maxlength="40" placeholder="Key name (e.g. my bot)" autocomplete="off"/>
+      <button id="api-create" type="button">Create key</button>
+    </div>
+    <p id="api-new" class="muted" style="margin-top:10px"></p>
+    <div id="api-list" style="margin-top:12px"></div>
+  </div>
+  <div class="card">
+    <h3 style="margin-bottom:8px">Docs</h3>
+    <p class="muted">Send the key as <code>X-API-Key</code> header (or <code>Bearer ghsk_…</code>). Quotas reset midnight UTC.</p>
+    <div class="codeblock"><div class="cb-head"><i></i><i></i><i></i><span>curl</span></div><pre><code>curl -X POST https://greedyhudzell.xyz/api/obfuscate \\
+  -H "Content-Type: application/json" \\
+  -H "X-API-Key: ghsk_YOUR_KEY" \\
+  -d '{"code": "print(1)", "preset": "good"}'
+
+curl -X POST https://greedyhudzell.xyz/validate \\
+  -H "Content-Type: application/json" \\
+  -H "X-API-Key: ghsk_YOUR_KEY" \\
+  -d '{"key": "GH-XXXX-XXXX-XXXX", "username": "SomeName"}'</code></pre></div>
+  </div>
+  <script>(function(){
+    var lic = "";
+    var planMax = 2;
+    function esc(s){ return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+    function msg(t, ok){ var p = document.getElementById("api-plan"); p.className = ok ? "ok" : "muted"; p.textContent = t; }
+    function copyText(t, done) {
+      function ok2(){ done(); }
+      if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(t).then(ok2, function(){}); }
+    }
+    async function refresh() {
+      var box = document.getElementById("api-list");
+      box.innerHTML = "<p class='muted'>Loading…</p>";
+      try {
+        var r = await fetch("/api/keys?license_key=" + encodeURIComponent(lic));
+        var d = await r.json();
+        if (!d.ok) { box.innerHTML = "<p class='err'>" + esc(d.error || "failed") + "</p>"; return; }
+        document.getElementById("api-plan-tag").textContent = d.plan || "?";
+        planMax = d.plan_max || 2;
+        if (!d.keys.length) { box.innerHTML = "<p class='muted'>No API keys yet — create one above.</p>"; return; }
+        var h = '<table><thead><tr><th>Name</th><th>Key</th><th>Rules</th><th></th></tr></thead><tbody>';
+        d.keys.forEach(function(k) {
+          var rules = (k.scopes || "") + (k.daily_limit ? " · ≤" + k.daily_limit + "/day" : "") + (k.expires_at ? " · exp " + new Date(k.expires_at * 1000).toLocaleDateString() : "") + (k.revoked ? " · REVOKED" : "");
+          h += "<tr><td>" + esc(k.name) + "</td>"
+            + "<td class='mono'>" + esc(k.prefix) + "…</td>"
+            + "<td class='muted'>" + esc(rules) + "</td>"
+            + "<td style='white-space:nowrap'><button class='btn' data-gear='" + esc(k.id) + "' type='button' title='rules'>⚙</button> "
+            + (k.revoked ? "" : "<button class='btn' data-revoke='" + esc(k.id) + "' type='button'>Revoke</button>") + "</td></tr>"
+            + "<tr class='gear-row' data-gearrow='" + esc(k.id) + "' hidden><td colspan='4'>"
+            + "daily cap <input data-f-limit style='width:90px;display:inline-block' type='number' min='1' max='" + planMax + "' value='" + (k.daily_limit || "") + "' placeholder='" + planMax + "'/> "
+            + "expires <input data-f-exp style='width:150px;display:inline-block' type='date'/> "
+            + "<label style='display:inline'><input data-f-s-obf type='checkbox'" + ((k.scopes || "").indexOf("obfuscate") >= 0 ? " checked" : "") + "/> obfuscate</label> "
+            + "<label style='display:inline'><input data-f-s-val type='checkbox'" + ((k.scopes || "").indexOf("validate") >= 0 ? " checked" : "") + "/> validate</label> "
+            + "<label style='display:inline'><input data-f-s-stats type='checkbox'" + ((k.scopes || "").indexOf("stats") >= 0 ? " checked" : "") + "/> stats</label> "
+            + "<button class='btn btn-gold' data-save='" + esc(k.id) + "' type='button'>Save</button></td></tr>";
+        });
+        box.innerHTML = h + "</tbody></table>";
+      } catch (e) { box.innerHTML = "<p class='err'>Network error.</p>"; }
+    }
+    document.getElementById("api-load").addEventListener("click", async function() {
+      lic = (document.getElementById("api-lic").value || "").trim();
+      if (!lic) { msg("Enter your license key first.", false); return; }
+      msg("Checking…", true);
+      try {
+        var r = await fetch("/api/keys?license_key=" + encodeURIComponent(lic));
+        var d = await r.json();
+        if (!d.ok) { msg("License rejected: " + (d.error || r.status), false); return; }
+        document.getElementById("api-mgr").hidden = false;
+        msg("Unlocked · plan " + (d.plan || "?") + " · up to " + (d.plan_max || 2) + "/day per key", true);
+        refresh();
+      } catch (e) { msg("Network error.", false); }
+    });
+    document.getElementById("api-create").addEventListener("click", async function() {
+      var name = (document.getElementById("api-name").value || "").trim() || "api key";
+      var out = document.getElementById("api-new");
+      out.className = "muted"; out.textContent = "Creating…";
+      try {
+        var r = await fetch("/api/keys", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ license_key: lic, name: name }) });
+        var d = await r.json();
+        if (!d.ok) { out.className = "err"; out.textContent = "Failed: " + (d.detail || d.error); return; }
+        out.className = "ok";
+        out.innerHTML = "Copy it NOW — shown once:<br><code id='api-fresh'>" + esc(d.api_key) + "</code> "
+          + "<button class='btn' id='api-fresh-copy' type='button'>Copy</button>";
+        document.getElementById("api-fresh-copy").addEventListener("click", function() {
+          copyText(d.api_key, function() { out.textContent = "Copied! " + d.api_key.slice(0, 13) + "…"; });
+        });
+        refresh();
+      } catch (e) { out.className = "err"; out.textContent = "Network error."; }
+    });
+    document.getElementById("api-list").addEventListener("click", async function(e) {
+      var g = e.target.closest ? e.target.closest("[data-gear]") : null;
+      var rv = e.target.closest ? e.target.closest("[data-revoke]") : null;
+      var sv = e.target.closest ? e.target.closest("[data-save]") : null;
+      if (g) {
+        var row = document.querySelector('[data-gearrow="' + g.dataset.gear + '"]');
+        if (row) row.hidden = !row.hidden;
+        return;
+      }
+      if (rv) {
+        if (!confirm("Revoke this API key? Existing integrations break immediately.")) return;
+        try {
+          var r = await fetch("/api/keys/revoke", { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ license_key: lic, id: rv.dataset.revoke }) });
+          var d = await r.json();
+          if (!d.ok) { alert("Failed: " + (d.error || r.status)); return; }
+          refresh();
+        } catch (err) { alert("Network error."); }
+        return;
+      }
+      if (sv) {
+        var row2 = document.querySelector('[data-gearrow="' + sv.dataset.save + '"]');
+        var lim = row2.querySelector("[data-f-limit]").value;
+        var exp = row2.querySelector("[data-f-exp]").value;
+        var sc = [];
+        if (row2.querySelector("[data-f-s-obf]").checked) sc.push("obfuscate");
+        if (row2.querySelector("[data-f-s-val]").checked) sc.push("validate");
+        if (row2.querySelector("[data-f-s-stats]").checked) sc.push("stats");
+        var payload = { license_key: lic, id: sv.dataset.save, scopes: sc };
+        payload.daily_limit = lim === "" ? null : Number(lim);
+        payload.expires_at = exp === "" ? null : Math.floor(new Date(exp + "T00:00:00Z").getTime() / 1000);
+        try {
+          var r2 = await fetch("/api/keys/rules", { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload) });
+          var d2 = await r2.json();
+          if (!d2.ok) { alert("Failed: " + (d2.detail || d2.error)); return; }
+          refresh();
+        } catch (err) { alert("Network error."); }
+      }
+    });
+  })();</script>
+`, true);
 }
 
 function pricingPage() {
@@ -3025,6 +3566,8 @@ async function handleSessionLevel(request, env) {
 
 /** Public totals for the site. */
 async function handlePublicStats(request, env) {
+  const qs = await endpointQuota(env, "stats", request, null, 2000);
+  if (!qs.ok) return json({ error: "daily_limit" }, 429);
   await ensureStatsTable(env);
   try {
     const r = await env.DB.prepare(
@@ -3339,6 +3882,7 @@ export default {
       if (request.method === "GET" && path === "/guide") return html(guidePage());
       if (request.method === "GET" && path === "/pricing") return html(pricingPage());
       if (request.method === "GET" && path === "/tos") return html(tosPage());
+      if (request.method === "GET" && path === "/api") return html(apiPage());
 
       // Lua proxies
       if (path === "/loader.lua") return proxyGithub("greedyloader.lua");
@@ -3365,6 +3909,7 @@ export default {
         return json(sc);
       }
       if (request.method === "POST" && path === "/api/obfuscate") {
+        await ensureObfTables(env);
         let body;
         try {
           body = await request.json();
@@ -3375,10 +3920,43 @@ export default {
         if (!code || code.length < 2) return json({ ok: false, error: "empty_code" }, 400);
         if (code.length > 1200000) return json({ ok: false, error: "code_too_large" }, 413);
         const preset = body.preset || "standard";
+        // --- quota: api key > license key > anonymous IP ---
+        const ident = await resolveObfIdentity(request, env, body);
+        if (ident.error) return json({ ok: false, error: ident.error }, ident.status);
+        const allow = await obfAllowance(env, ident, request);
+        if (!allow.ok) {
+          return json({ ok: false, error: "daily_limit", limit: allow.limit, used: allow.used,
+            reset_hint: "quota resets midnight UTC" + (allow.bonus ? "" : " · finish Work.ink steps for +1") }, 429);
+        }
+        // --- result cache: identical code+preset never bills twice ---
+        const chash = await sha256("obf1|" + preset + "|" + code);
+        try {
+          const hit = await env.DB.prepare(
+            `SELECT output, out_chars FROM obf_cache WHERE code_hash = ? LIMIT 1`
+          ).bind(chash).first();
+          if (hit && hit.output) {
+            await obfRecordUse(env, ident, allow.day);
+            return json({ ok: true, code: hit.output, mode: "cache", cached: true,
+              seed: null, left_today: allow.left, plan: allow.plan, bonus: allow.bonus || null });
+          }
+        } catch {}
         const apiKey = env.LUAOBF_API_KEY || LUAOBF_FALLBACK;
         try {
           const result = await runObfuscatePipeline(code, preset, apiKey, body.options || {});
-          return json(result, result.ok ? 200 : 502);
+          if (result && result.ok) {
+            await obfRecordUse(env, ident, allow.day);
+            try {
+              await env.DB.prepare(
+                `INSERT INTO obf_cache (code_hash, output, out_chars, preset, created_at) VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(code_hash) DO NOTHING`
+              ).bind(chash, result.code, String(result.code || "").length, preset, now()).run();
+              await env.DB.prepare(
+                `DELETE FROM obf_cache WHERE code_hash NOT IN (SELECT code_hash FROM obf_cache ORDER BY created_at DESC LIMIT 2000)`
+              ).run();
+            } catch {}
+          }
+          return json({ ...result, left_today: allow.left, plan: allow.plan, bonus: allow.bonus || null },
+            result.ok ? 200 : 502);
         } catch (e) {
           return json({
             ok: true,
@@ -3388,6 +3966,12 @@ export default {
           });
         }
       }
+      if (request.method === "POST" && path === "/api/keys") return await handleApiKeyCreate(request, env);
+      if (request.method === "GET" && path === "/api/keys") return await handleApiKeyList(request, env);
+      if (request.method === "POST" && path === "/api/keys/revoke") return await handleApiKeyRevoke(request, env);
+      if (request.method === "POST" && path === "/api/keys/rules") return await handleApiKeyRules(request, env);
+      if (request.method === "POST" && path === "/admin/obf-grant") return await handleAdminObfGrant(request, env);
+      if (request.method === "GET" && path === "/api") return html(apiPage());
 
             // KEY SYSTEM
       if (request.method === "GET" && path.startsWith("/get-key/token/")) {
