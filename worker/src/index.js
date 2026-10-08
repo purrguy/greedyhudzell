@@ -1111,6 +1111,8 @@ async function handleAdminKeysByDiscord(request, env) {
       username: k.username,
       plan: k.plan || "day",
       discord_id: k.discord_id != null ? String(k.discord_id) : null,
+      hwid: k.hwid || null,
+      hwid_free: Number(k.hwid_free) === 1,
       executed: k.executed === 1,
       activated: k.activated === 1 || k.executed === 1,
       last_execution: k.last_execution,
