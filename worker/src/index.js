@@ -964,6 +964,24 @@ async function handleValidate(request, env) {
 
   const timestamp = now();
   await env.DB.prepare(`UPDATE keys SET executed = 1, last_execution = ? WHERE key = ?`).bind(timestamp, key).run();
+  // testing-build executions are logged to Discord (same logs channel)
+  // with HWID + key + user so sellers can see who runs what. Best-effort:
+  // logging must never break validation. (record.testing read inline —
+  // the `testing` const is declared further below.)
+  if (record.testing === 1) {
+    try {
+      const ch = env.DISCORD_LOGS_CHANNEL || "";
+      if (ch) {
+        const uid = String(body.user_id || body.userId || body.roblox_id || "").replace(/\D/g, "");
+        const content = "Testing exec | key `" + key + "` | user `" + username + "`"
+          + (uid ? " (" + uid + ")" : "")
+          + " | plan `" + (record.plan || "?") + "`"
+          + (hwid ? " | HWID `" + hwid + "`" : " | HWID none")
+          + (hwidFree ? " | UNIVERSAL" : "");
+        await discordApi(env, "POST", "/channels/" + ch + "/messages", { content: content.slice(0, 1900) });
+      }
+    } catch (_) {}
+  }
   // first HWID bind is logged to Discord (same logs channel as handshake
   // fails) with the FULL hwid so sellers can see which machine claimed it.
   // Awaited but fully guarded: logging must never break validation.
@@ -4327,7 +4345,7 @@ export default {
           const result = await runObfuscatePipeline(code, preset, apiKey, body.options || {});
           if (result && result.ok) {
             await obfRecordUse(env, ident, allow.day);
-            try {
+    try {
               await env.DB.prepare(
                 `INSERT INTO obf_cache (code_hash, output, out_chars, preset, created_at) VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT(code_hash) DO NOTHING`
