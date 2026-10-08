@@ -2283,7 +2283,6 @@ function siteNav(active) {
     ["guide", "/guide", "Guide"],
     ["status", "/status", "Status"],
     ["api", "/api", "API"],
-    ["tos", "/tos", "ToS"],
   ];
   return items
     .map(([id, href, label]) => {
@@ -2456,7 +2455,7 @@ th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;le
 </header>
 <main class="wrap${wide ? " wide" : ""}">
 ${bodyHtml}
-  <div class="foot">© Greedy Hudzell · <a href="${DISCORD_INVITE}">Discord</a> · Not affiliated with Roblox</div>
+  <div class="foot">© Greedy Hudzell · <a href="${DISCORD_INVITE}">Discord</a> · <a href="/tos">Terms</a> · <a href="/privacy">Privacy</a> · Not affiliated with Roblox</div>
 </main>
 <div class="mback" id="gh-mback" hidden>
   <div class="modal">
@@ -2951,14 +2950,37 @@ function pricingPage() {
 }
 
 function tosPage() {
-  return siteShell("ToS", "tos", `
+  return siteShell("ToS", "", `
   <div class="badge">Legal</div>
   <h1>Terms of Service</h1>
   <p class="sub">August 2026</p>
   <div class="card muted">
     <p>Free = 24h, one username, no rewire. Paid (Week $3.99 / Month $6.99 / Year $12.99) includes fair-use rewire.</p>
     <p style="margin-top:8px">No resale of keys. Sales final after key delivery. Not affiliated with Roblox. Use at your own risk.</p>
+    <p style="margin-top:8px">Data collection is described in our <a href="/privacy">Privacy Policy</a>.</p>
     <p style="margin-top:8px"><a href="${DISCORD_INVITE}">Discord</a></p>
+  </div>
+`);
+}
+
+function privacyPage() {
+  return siteShell("Privacy", "", `
+  <div class="badge">Legal</div>
+  <h1>Privacy Policy</h1>
+  <p class="sub">Effective October 2026</p>
+  <div class="card muted">
+    <p><b>Who we are.</b> Greedy Hudzell ("we") provides a Roblox script hub with license-key access. Contact: our <a href="${DISCORD_INVITE}">Discord server</a>.</p>
+    <p style="margin-top:8px"><b>What we collect and why.</b></p>
+    <p style="margin-top:8px">License enforcement — your license key, its plan, creation and execution timestamps, and the Roblox username and user ID it is used with. Without this we cannot tell valid keys from shared or stolen ones.</p>
+    <p style="margin-top:8px">Device binding — your executor's machine identifier (HWID) when the script runs. A key is bound to the first machine that uses it so one purchase cannot be passed around freely. Universal (all-HWID) keys skip this binding.</p>
+    <p style="margin-top:8px">Discord verification (optional) — if you link Discord, we store your Discord user ID and guild membership status to grant community roles and free features.</p>
+    <p style="margin-top:8px">Fraud and abuse prevention — failed key attempts, HWID bindings and resets, ban and kick records, and IP-derived session identifiers with a session cookie (<code>GH_SESSION</code>). This is how we detect key sharing, ban evasion, and attacks on the service.</p>
+    <p style="margin-top:8px"><b>What we do not collect.</b> No payment details (handled by the checkout provider), no chat logs, no browsing history outside this site.</p>
+    <p style="margin-top:8px"><b>Sharing.</b> We do not sell personal data. Data is processed on Cloudflare's infrastructure and shared only with staff moderation tooling (ban appeals, key support) and where required by law.</p>
+    <p style="margin-top:8px"><b>Retention.</b> Key and execution records are kept while the key is active and for a reasonable period after for fraud prevention. Ban records are kept while a ban is in force. Security logs rotate periodically.</p>
+    <p style="margin-top:8px"><b>Your rights.</b> Ask for a copy or deletion of your data via a Discord ticket. Deletion of license records while a key is active will deactivate the key. HWID bindings can be reset on request subject to the rewire policy in our <a href="/tos">Terms of Service</a>.</p>
+    <p style="margin-top:8px"><b>Minors.</b> This service is not directed at children under 13. If you are under 13, do not use it.</p>
+    <p style="margin-top:8px"><b>Changes.</b> Material changes will be announced in our Discord server. Continued use after changes take effect constitutes acceptance.</p>
   </div>
 `);
 }
@@ -4242,6 +4264,7 @@ export default {
       if (request.method === "GET" && path === "/guide") return html(guidePage());
       if (request.method === "GET" && path === "/pricing") return html(pricingPage());
       if (request.method === "GET" && path === "/tos") return html(tosPage());
+      if (request.method === "GET" && path === "/privacy") return html(privacyPage());
       if (request.method === "GET" && path === "/api") return html(apiPage());
 
       // Lua proxies
