@@ -2282,7 +2282,6 @@ function siteNav(active) {
     ["executors", "/executors", "Executors"],
     ["guide", "/guide", "Guide"],
     ["status", "/status", "Status"],
-    ["api", "/api", "API"],
   ];
   return items
     .map(([id, href, label]) => {
