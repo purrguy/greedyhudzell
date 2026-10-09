@@ -4159,12 +4159,14 @@ async function handleCreateWebhook(request, env) {
   }
   const key = typeof body.key === "string" ? body.key.trim() : "";
   const username = typeof body.username === "string" ? body.username.trim() : "";
-  if (!key || !username) return json({ ok: false, error: "key+username" }, 400);
-  if (await isBanned(env, key, username, body.user_id || body.roblox_id, body.hwid)) return json({ ok: false, error: "banned" }, 403);
+  // hub sends discord_id + key + name (no username) — accept all shapes
+  const who = username || (typeof body.name === "string" ? body.name.trim().replace(/^GH\s+/, "") : "") || (typeof body.roblox_user === "string" ? body.roblox_user.trim() : "");
+  if (!key || !who) return json({ ok: false, error: "key+username" }, 400);
+  if (await isBanned(env, key, who, body.user_id || body.roblox_id, body.hwid)) return json({ ok: false, error: "banned" }, 403);
   const token = env.DISCORD_BOT_TOKEN || env.DISCORD_TOKEN;
   if (!token) return json({ ok: false, error: "no bot token" }, 500);
   const channelId = "1546938830333153321";
-  const name = username.replace(/[^\w\- ]/g, "").slice(0, 80) || "gh-user";
+  const name = who.replace(/[^\w\- ]/g, "").slice(0, 80) || "gh-user";
   const res = await fetch(`https://discord.com/api/v10/channels/${channelId}/webhooks`, {
     method: "POST",
     headers: {
@@ -4179,7 +4181,7 @@ async function handleCreateWebhook(request, env) {
   await env.DB.prepare(
     `INSERT OR REPLACE INTO webhooks_meta (webhook_id, url, roblox_name, discord_id, created_at) VALUES (?, ?, ?, ?, ?)`
   )
-    .bind(String(data.id), urlWh, username, body.discord_id || "", now())
+    .bind(String(data.id), urlWh, who, body.discord_id || "", now())
     .run();
   return json({ ok: true, url: urlWh });
 }
