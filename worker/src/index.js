@@ -3008,14 +3008,17 @@ function privacyPage() {
 function isPaidPlan(plan, key) {
   const p = String(plan || "").toLowerCase();
   if (p === "week" || p === "month" || p === "year" || p === "paid") return true;
+  // testing keys are staff-only and must pass every paid gate
+  if (p === "testing") return true;
   if (typeof key === "string" && key.startsWith("GH-PAID-")) return true;
   return false;
 }
 
 /* ===================== 5.2.0 KEY AUTH ===================== */
-// plan rank: highest valid key wins (year > month > week > day; free = -1)
+// plan rank: highest valid key wins (testing > year > month > week > day; free = -1)
 function planRank(plan) {
   const p = String(plan || "").toLowerCase();
+  if (p === "testing") return 4;
   if (p === "year") return 3;
   if (p === "month") return 2;
   if (p === "week") return 1;
