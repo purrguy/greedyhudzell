@@ -881,6 +881,9 @@ async function handleValidate(request, env) {
   const username = typeof body.username === "string" ? body.username.trim() : "";
   const discordId = String(body.discord_id || body.discordId || "").replace(/\D/g, "") || null;
   const hwid = typeof body.hwid === "string" ? body.hwid.trim().slice(0, 128) : "";
+  // multi-game router (loader sends game: parkour | rails | desert). Unknown = parkour.
+  const gameRaw = typeof body.game === "string" ? body.game.trim().toLowerCase() : "parkour";
+  const gameId = gameRaw === "rails" || gameRaw === "desert" ? gameRaw : "parkour";
   // keys: explicit list wins, single key appended for old loaders
   let candidates = [];
   if (Array.isArray(body.keys)) candidates = body.keys.filter((k) => typeof k === "string").map((k) => k.trim()).filter(Boolean);
@@ -1022,10 +1025,11 @@ async function handleValidate(request, env) {
       if (link && link.discord_id) verified = true;
     } catch (_) {}
   }
-  const script = await fetchSecretScript(env, testing);
+  const script = await fetchSecretScript(env, testing, gameId);
   return json({
     valid: true,
     key,
+    game: gameId,
     expires_at: record.expires_at,
     plan: record.plan || "day",
     username: username,
@@ -2172,7 +2176,7 @@ async function runObfuscatePipeline(code, preset, apiKey, options) {
 }
 
 function obfuscatePage(siteName) {
-  return siteShell("Obfuscator", "obfuscator", `
+  return siteShell("Lua Obfuscator Tool | Greedy Hudzell", "obfuscator", `
   <div class="badge">Tools</div>
   <h1>Lua Obfuscator</h1>
   <p class="sub">Long-bracket contents processed when present · safe API plugins · optional Shamir helper · one-line minify</p>
@@ -2309,14 +2313,15 @@ function siteNav(active) {
     .join("");
 }
 
-function siteShell(title, active, bodyHtml, wide = false) {
+function siteShell(title, active, bodyHtml, wide = false, desc = "Greedy Hudzell — Parkour Legacy script hub for Roblox: license keys, script loader, setup guide and pricing.") {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="description" content="${desc}"/>
 <link rel="icon" type="image/png" href="https://raw.githubusercontent.com/purrguy/greedyhudzell/main/logo.png"/>
-<title>${title} · Greedy Hudzell</title>
+<title>${title}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
 :root{
@@ -2560,10 +2565,10 @@ function fmtSunc(v) {
 }
 
 function homePage() {
-  return siteShell("Home", "home", `
+  return siteShell("Greedy Hudzell \u2014 Parkour Legacy Script Hub | Keys, Loader & Guide", "home", `
   <img src="https://raw.githubusercontent.com/purrguy/greedyhudzell/main/GH%20banner.png" alt="Greedy Hudzell" style="width:100%;border-radius:12px;margin-bottom:14px" onerror="this.style.display='none'"/>
-  <h1>Greedy Hudzell</h1>
-  <p class="sub">Keys, loader, updates. Check your key status below.</p>
+  <h1>Greedy Hudzell \u2014 Parkour Legacy Script</h1>
+  <p class="sub">Roblox parkour script hub \u2014 license keys, script loader, setup guides and updates. Check your key status below.</p>
   <div class="hero-actions">
     <button class="btn btn-gold" id="m-free-btn" type="button">Select method</button>
     <a class="btn" href="/pricing">Pricing</a>
@@ -2642,7 +2647,7 @@ function homePage() {
 }
 
 function statusPage() {
-  return siteShell("Status", "status", `
+  return siteShell("Status \u2014 Greedy Hudzell Service Health", "status", `
   <div class="badge">Ops</div>
   <h1>Status</h1>
   <p class="sub">Public endpoints. For live incidents use Discord status channel.</p>
@@ -2661,7 +2666,7 @@ function statusPage() {
 
 function executorsPage() {
   // Client-side fetch + safe sUNC formatting
-  return siteShell("Executors", "executors", `
+  return siteShell("Executor Compatibility \u2014 Greedy Hudzell Parkour Script", "executors", `
   <div class="badge">Compatibility</div>
   <h1>Executors</h1>
   <p class="sub">Best-effort list. Prefer tools with HTTP, files, and queue_on_teleport.</p>
@@ -2726,7 +2731,7 @@ function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"
 }
 
 function guidePage() {
-  return siteShell("Guide", "guide", `
+  return siteShell("Parkour Legacy Script Guide \u2014 Install & First Run | Greedy Hudzell", "guide", `
   <div class="badge">Docs</div>
   <h1>Guide</h1>
   <p class="sub">Free key → loader → hub.</p>
@@ -2740,7 +2745,7 @@ function guidePage() {
 }
 
 function apiPage() {
-  return siteShell("API", "api", `
+  return siteShell("API Access | Greedy Hudzell", "api", `
   <div class="badge">Developers</div>
   <h1>API access</h1>
   <p class="sub">Keys inherit your license plan (free: 2 obfuscations/day · week: 10 · month: 30 · year: 50). Complete both Work.ink steps for +1/day. Never expires unless you revoke it.</p>
@@ -2889,7 +2894,7 @@ curl -X POST https://greedyhudzell.xyz/validate \\
 }
 
 function pricingPage() {
-  return siteShell("Pricing", "pricing", `
+  return siteShell("Pricing \u2014 Free & Paid Parkour Legacy Plans | Greedy Hudzell", "pricing", `
   <div class="page-header">
     <div class="badge">USD</div>
     <h1>Pricing</h1>
@@ -2967,7 +2972,7 @@ function pricingPage() {
 }
 
 function tosPage() {
-  return siteShell("ToS", "", `
+  return siteShell("Terms of Service | Greedy Hudzell", "", `
   <div class="badge">Legal</div>
   <h1>Terms of Service</h1>
   <p class="sub">August 2026</p>
@@ -2981,7 +2986,7 @@ function tosPage() {
 }
 
 function privacyPage() {
-  return siteShell("Privacy", "", `
+  return siteShell("Privacy Policy | Greedy Hudzell", "", `
   <div class="badge">Legal</div>
   <h1>Privacy Policy</h1>
   <p class="sub">Effective October 2026</p>
@@ -3053,14 +3058,28 @@ async function isGuildMember(env, discordId) {
     return false;
   }
 }
-// private repo script fetch (gh-secret). Needs GITHUB_TOKEN secret.
-// normal key -> greedy.lua, testing key -> greedytesting.lua
-async function fetchSecretScript(env, testing) {
+// private repo script fetch (multi-game). Needs GITHUB_TOKEN secret.
+// parkour: greedy.lua / greedytesting.lua (gh-secret)
+// rails:   greedyrails.lua (RAILS_SECRET_REPO, default purrguy/rails-secret)
+// desert:  greedydesert.lua (DESERT_SECRET_REPO, default purrguy/gh-secret)
+async function fetchSecretScript(env, testing, game) {
   const token = env.GITHUB_TOKEN || "";
   if (!token) return { ok: false, reason: "no_github_token" };
-  const repo = env.GH_SECRET_REPO || "purrguy/gh-secret";
-  const file = testing ? (env.GH_SECRET_TESTING_FILE || "greedytesting.lua")
-                       : (env.GH_SECRET_FILE || "greedy.lua");
+  const g = game === "rails" ? "rails" : game === "desert" ? "desert" : "parkour";
+  let repo, file;
+  if (g === "rails") {
+    repo = env.RAILS_SECRET_REPO || "purrguy/rails-secret";
+    file = testing ? (env.RAILS_SECRET_TESTING_FILE || env.RAILS_SECRET_FILE || "greedyrails.lua")
+                   : (env.RAILS_SECRET_FILE || "greedyrails.lua");
+  } else if (g === "desert") {
+    repo = env.DESERT_SECRET_REPO || "purrguy/gh-secret";
+    file = testing ? (env.DESERT_SECRET_TESTING_FILE || env.DESERT_SECRET_FILE || "greedydesert.lua")
+                   : (env.DESERT_SECRET_FILE || "greedydesert.lua");
+  } else {
+    repo = env.GH_SECRET_REPO || "purrguy/gh-secret";
+    file = testing ? (env.GH_SECRET_TESTING_FILE || "greedytesting.lua")
+                   : (env.GH_SECRET_FILE || "greedy.lua");
+  }
   try {
     const res = await fetch(`https://api.github.com/repos/${repo}/contents/${file}`, {
       headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.raw", "User-Agent": "greedyhudzell-worker" },
@@ -3132,11 +3151,14 @@ function avatarUrlFromUser(user) {
 
 async function handleDiscordDebug(request, env) {
   const token = getDiscordBotToken(env);
+  const logsCh = env.DISCORD_LOGS_CHANNEL || "";
   return json({
     ok: true,
     has_token: Boolean(token),
     token_len: token ? token.length : 0,
     token_prefix: token ? String(token).slice(0, 4) + "…" : null,
+    has_logs_channel: logsCh.length >= 5,
+    can_post_logs: Boolean(token) && logsCh.length >= 5,
     guild_id: env.DISCORD_GUILD_ID || "1422222409846620201",
     member_role: env.DISCORD_MEMBER_ROLE || "1445500571640402052",
     source_names_checked: ["DISCORD_BOT_TOKEN", "DISCORD_TOKEN", "BOT_TOKEN"],
@@ -4290,6 +4312,16 @@ export default {
       if (request.method === "GET" && path === "/api") return html(apiPage());
 
       // Lua proxies
+      if (path === "/robots.txt") {
+        return plain("User-agent: *\nAllow: /\nSitemap: https://greedyhudzell.xyz/sitemap.xml\n");
+      }
+      if (path === "/sitemap.xml") {
+        const pages = ["/home", "/guide", "/pricing", "/status", "/executors", "/tos", "/privacy", "/obfuscator", "/api"];
+        const urls = pages.map((p) => `  <url><loc>https://greedyhudzell.xyz${p}</loc><changefreq>weekly</changefreq></url>`).join("\n");
+        return new Response(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>`, {
+          headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "no-cache" },
+        });
+      }
       if (path === "/loader.lua") return proxySecret(env, "greedyloader.lua");
       if (path === "/script.lua") return plain("gone: hub ships inside /validate since 5.2.0", 410);
       if (path === "/library.lua") return proxyGithub("greedylibrary.lua");
