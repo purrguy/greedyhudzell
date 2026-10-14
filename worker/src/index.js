@@ -3060,7 +3060,7 @@ async function isGuildMember(env, discordId) {
 }
 // private repo script fetch (multi-game). Needs GITHUB_TOKEN secret.
 // parkour: greedy.lua / greedytesting.lua (gh-secret)
-// rails:   greedyrails.lua (RAILS_SECRET_REPO, default purrguy/rails-secret)
+// rails:   greedyrails.lua (gh-secret; override via RAILS_SECRET_REPO/FILE)
 // desert:  greedydesert.lua (DESERT_SECRET_REPO, default purrguy/gh-secret)
 async function fetchSecretScript(env, testing, game) {
   const token = env.GITHUB_TOKEN || "";
@@ -3068,7 +3068,7 @@ async function fetchSecretScript(env, testing, game) {
   const g = game === "rails" ? "rails" : game === "desert" ? "desert" : "parkour";
   let repo, file;
   if (g === "rails") {
-    repo = env.RAILS_SECRET_REPO || "purrguy/rails-secret";
+    repo = env.RAILS_SECRET_REPO || "purrguy/gh-secret";
     file = testing ? (env.RAILS_SECRET_TESTING_FILE || env.RAILS_SECRET_FILE || "greedyrails.lua")
                    : (env.RAILS_SECRET_FILE || "greedyrails.lua");
   } else if (g === "desert") {
