@@ -1036,6 +1036,14 @@ async function handleValidate(request, env) {
   const paid = isPaidPlan(record.plan, key);
   const discordBound = record.discord_id || discordId || null;
   let verified = await isGuildMember(env, discordBound);
+  // resolve discord username for UI display
+  let discordUsername = null;
+  if (discordBound) {
+    try {
+      const m = await env.DB.prepare(`SELECT username FROM members WHERE discord_id = ? LIMIT 1`).bind(discordBound).first();
+      if (m && m.username) discordUsername = String(m.username);
+    } catch (_) {}
+  }
   if (!verified && hwid) {
     try {
       const link = await env.DB.prepare(`SELECT discord_id FROM hwid_discord WHERE hwid = ? LIMIT 1`).bind(hwid).first();
@@ -1051,6 +1059,7 @@ async function handleValidate(request, env) {
     plan: record.plan || "day",
     username: username,
     discord_id: discordBound,
+    discord_username: discordUsername,
     discord_linked: Boolean(discordBound),
     member_verified: verified,
     paid,
@@ -3552,6 +3561,10 @@ async function handleOauthCallback(request, env) {
         ).bind(keyFlow.hwid, null, ipHash, prior ? 1 : 0, Math.floor(Date.now() / 1000)).run();
         if (prior) {
           await env.DB.prepare(`UPDATE verification_ips SET matched = 1 WHERE hwid = ? AND ip_hash = ?`).bind(keyFlow.hwid, ipHash).run();
+          // link the matched key to this discord user
+          try {
+            await env.DB.prepare(`UPDATE keys SET discord_id = ? WHERE hwid = ? AND (discord_id IS NULL OR discord_id = '')`).bind(state, keyFlow.hwid).run();
+          } catch (_) {}
         }
       } catch (_) {}
     }
