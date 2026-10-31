@@ -1014,6 +1014,23 @@ async function handleValidate(request, env) {
       ).bind(hwid, key, timestamp).run();
     } catch (_) {}
   }
+  // ---- IP hash logging (browser side) ----
+  try {
+    const ipSalt = env.IP_SALT || "gh-ip-salt-v1";
+    const ipHash = await sha256(getClientIP(request) + "|" + ipSalt);
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS verification_ips (id INTEGER PRIMARY KEY AUTOINCREMENT, hwid TEXT NOT NULL, key TEXT, ip_hash TEXT NOT NULL, source TEXT NOT NULL, matched INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`
+    ).run();
+    const prior = await env.DB.prepare(
+      `SELECT id FROM verification_ips WHERE hwid = ? AND ip_hash = ? AND source = 'discord' LIMIT 1`
+    ).bind(hwid, ipHash).first();
+    await env.DB.prepare(
+      `INSERT INTO verification_ips (hwid, key, ip_hash, source, matched, created_at) VALUES (?, ?, ?, 'browser', ?, ?)`
+    ).bind(hwid, key, ipHash, prior ? 1 : 0, now()).run();
+    if (prior) {
+      await env.DB.prepare(`UPDATE verification_ips SET matched = 1 WHERE hwid = ? AND ip_hash = ?`).bind(hwid, ipHash).run();
+    }
+  } catch (_) {}
 
   const testing = record.testing === 1;
   const paid = isPaidPlan(record.plan, key);
@@ -3520,6 +3537,22 @@ async function handleOauthCallback(request, env) {
           `INSERT INTO hwid_discord (hwid, discord_id, verified_at) VALUES (?, ?, ?)
            ON CONFLICT(hwid) DO UPDATE SET discord_id = excluded.discord_id, verified_at = excluded.verified_at`
         ).bind(keyFlow.hwid, state, Math.floor(Date.now() / 1000)).run();
+      } catch (_) {}
+            try {
+        await env.DB.prepare(
+          `CREATE TABLE IF NOT EXISTS verification_ips (id INTEGER PRIMARY KEY AUTOINCREMENT, hwid TEXT NOT NULL, key TEXT, ip_hash TEXT NOT NULL, source TEXT NOT NULL, matched INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`
+        ).run();
+        const ipSalt = env.IP_SALT || "gh-ip-salt-v1";
+        const ipHash = await sha256(getClientIP(request) + "|" + ipSalt);
+        const prior = await env.DB.prepare(
+          `SELECT id FROM verification_ips WHERE hwid = ? AND ip_hash = ? AND source = 'browser' LIMIT 1`
+        ).bind(keyFlow.hwid, ipHash).first();
+        await env.DB.prepare(
+          `INSERT INTO verification_ips (hwid, key, ip_hash, source, matched, created_at) VALUES (?, ?, ?, 'discord', ?, ?)`
+        ).bind(keyFlow.hwid, null, ipHash, prior ? 1 : 0, Math.floor(Date.now() / 1000)).run();
+        if (prior) {
+          await env.DB.prepare(`UPDATE verification_ips SET matched = 1 WHERE hwid = ? AND ip_hash = ?`).bind(keyFlow.hwid, ipHash).run();
+        }
       } catch (_) {}
     }
   }
