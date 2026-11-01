@@ -4050,11 +4050,24 @@ async function handleAdminBan(request, env) {
   }
   const key = typeof body.key === "string" ? body.key.trim() : "";
   const username = typeof body.username === "string" ? body.username.trim() : "";
-  const userId = String(body.user_id || body.userId || body.roblox_id || "").trim();
-  const hwid = String(body.hwid || "").trim().slice(0, 128);
+  let userId = String(body.user_id || body.userId || body.roblox_id || "").trim();
+  let hwid = String(body.hwid || "").trim().slice(0, 128);
   const reason = body.reason || "Banned from Greedy Hudzell";
   const by = String(body.by_discord || "");
-  if (!key && !username && !userId && !hwid) return json({ success: false, reason: "need key, username, user_id or hwid" }, 400);
+  // resolve from discord id (IP-linked / verified) if nothing else given
+  if (!key && !username && !userId && !hwid && by) {
+    try {
+      const link = await env.DB.prepare(`SELECT hwid FROM hwid_discord WHERE discord_id = ? LIMIT 1`).bind(by).first();
+      if (link && link.hwid) hwid = String(link.hwid).slice(0, 128);
+    } catch (_) {}
+    if (!userId) {
+      try {
+        const krow = await env.DB.prepare(`SELECT user_id FROM keys WHERE discord_id = ? LIMIT 1`).bind(by).first();
+        if (krow && krow.user_id) userId = String(krow.user_id).trim();
+      } catch (_) {}
+    }
+  }
+  if (!key && !username && !userId && !hwid) return json({ success: false, reason: "need key, username, user_id, hwid or by_discord" }, 400);
   if (hwid && hwid.length < 8) return json({ success: false, reason: "hwid_too_short", message: "HWID needs 8+ chars (paste full or 16-char prefix from logs)" }, 400);
   const ts = now();
   // HWID ban = whole machine: revoke every key bound to it, ban each key +
