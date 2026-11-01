@@ -1035,12 +1035,24 @@ async function handleValidate(request, env) {
   const testing = record.testing === 1;
   const paid = isPaidPlan(record.plan, key);
   const discordBound = record.discord_id || discordId || null;
-  let verified = await isGuildMember(env, discordBound);
+  // fallback: resolve discord from hwid_discord if key has no discord_id
+  let _discordBound = discordBound;
+  if (!_discordBound && hwid) {
+    try {
+      const link = await env.DB.prepare(`SELECT discord_id FROM hwid_discord WHERE hwid = ? LIMIT 1`).bind(hwid).first();
+      if (link && link.discord_id) {
+        _discordBound = String(link.discord_id);
+        try { await env.DB.prepare(`UPDATE keys SET discord_id = ? WHERE key = ? AND (discord_id IS NULL OR discord_id = '')`).bind(_discordBound, key).run(); } catch (_) {}
+      }
+    } catch (_) {}
+  }
+  const discordResolved = _discordBound;
+  let verified = await isGuildMember(env, discordResolved);
   // resolve discord username for UI display
   let discordUsername = null;
-  if (discordBound) {
+  if (discordResolved) {
     try {
-      const m = await env.DB.prepare(`SELECT username FROM members WHERE discord_id = ? LIMIT 1`).bind(discordBound).first();
+      const m = await env.DB.prepare(`SELECT username FROM members WHERE discord_id = ? LIMIT 1`).bind(discordResolved).first();
       if (m && m.username) discordUsername = String(m.username);
     } catch (_) {}
   }
@@ -1058,7 +1070,7 @@ async function handleValidate(request, env) {
     expires_at: record.expires_at,
     plan: record.plan || "day",
     username: username,
-    discord_id: discordBound,
+    discord_id: discordResolved,
     discord_username: discordUsername,
     discord_linked: Boolean(discordBound),
     member_verified: verified,
@@ -3561,11 +3573,11 @@ async function handleOauthCallback(request, env) {
         ).bind(keyFlow.hwid, null, ipHash, prior ? 1 : 0, Math.floor(Date.now() / 1000)).run();
         if (prior) {
           await env.DB.prepare(`UPDATE verification_ips SET matched = 1 WHERE hwid = ? AND ip_hash = ?`).bind(keyFlow.hwid, ipHash).run();
-          // link the matched key to this discord user
-          try {
-            await env.DB.prepare(`UPDATE keys SET discord_id = ? WHERE hwid = ? AND (discord_id IS NULL OR discord_id = '')`).bind(state, keyFlow.hwid).run();
-          } catch (_) {}
         }
+        // link the key to this discord user regardless of IP match
+        try {
+          await env.DB.prepare(`UPDATE keys SET discord_id = ? WHERE hwid = ? AND (discord_id IS NULL OR discord_id = '')`).bind(state, keyFlow.hwid).run();
+        } catch (_) {}
       } catch (_) {}
     }
   }
